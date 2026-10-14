@@ -1,0 +1,336 @@
+
+
+
+
+httpbis                                                           K. Oku
+Internet-Draft                                                    Fastly
+Intended status: Standards Track                               L. Pardue
+Expires: 28 December 2026                                     Cloudflare
+                                                              J. Iyengar
+                                                                 Netflix
+                                                            26 June 2026
+
+
+                            HTTP/3 over QMux
+                draft-kazuho-httpbis-http3-over-qmux-00
+
+Abstract
+
+   This document specifies how to use HTTP/3 over QMux.
+
+Discussion Venues
+
+   This note is to be removed before publishing as an RFC.
+
+   Discussion of this document takes place on the HTTP Working Group
+   mailing list (ietf-http-wg@w3.org), which is archived at
+   https://lists.w3.org/Archives/Public/ietf-http-wg/.
+
+   Source for this draft and an issue tracker can be found at
+   https://github.com/kazuho/draft-kazuho-httpbis-http3-on-streams.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 28 December 2026.
+
+Copyright Notice
+
+   Copyright (c) 2026 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+
+
+Oku, et al.             Expires 28 December 2026                [Page 1]
+
+Internet-Draft              HTTP/3 over QMux                   June 2026
+
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.  Code Components
+   extracted from this document must include Revised BSD License text as
+   described in Section 4.e of the Trust Legal Provisions and are
+   provided without warranty as described in the Revised BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Conventions and Definitions . . . . . . . . . . . . . . . . .   3
+   3.  The Protocol  . . . . . . . . . . . . . . . . . . . . . . . .   3
+     3.1.  QPACK Considerations  . . . . . . . . . . . . . . . . . .   3
+   4.  Starting HTTP/3 over QMux . . . . . . . . . . . . . . . . . .   3
+     4.1.  Draft Version Identification  . . . . . . . . . . . . . .   4
+   5.  Security Considerations . . . . . . . . . . . . . . . . . . .   4
+   6.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .   4
+   7.  References  . . . . . . . . . . . . . . . . . . . . . . . . .   4
+     7.1.  Normative References  . . . . . . . . . . . . . . . . . .   4
+     7.2.  Informative References  . . . . . . . . . . . . . . . . .   5
+   Acknowledgments . . . . . . . . . . . . . . . . . . . . . . . . .   5
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .   5
+
+1.  Introduction
+
+   As of 2026, HTTP/2 [HTTP/2] remains the most widely used version of
+   HTTP across the Internet, although the adoption rate of HTTP/3
+   [HTTP/3] is increasing rapidly.
+
+   HTTP/3 has several advantages over HTTP/2, primarily due to its use
+   of QUIC [QUIC] as the transport layer protocol, which provides
+   features like stream multiplexing without head-of-line blocking and
+   low-latency connection establishment.
+
+   However, given that QUIC's availability and accessibility are not as
+   universal as TCP's, a complete migration of all HTTP/2 traffic to
+   QUIC-based HTTP/3 seems unlikely.
+
+   This situation necessitates HTTP deployments to support both
+   transport protocols and their respective HTTP versions for the
+   foreseeable future.
+
+   Maintaining dual support is costly, as the two protocols differ in
+   many aspects such as wire-encoding, flow control and stream
+   multiplexing machinery, and HTTP header compression.  Extensions
+   operating at the HTTP wire encoding layer must be developed and
+
+
+
+Oku, et al.             Expires 28 December 2026                [Page 2]
+
+Internet-Draft              HTTP/3 over QMux                   June 2026
+
+
+   implemented for both HTTP/2 and HTTP/3, and both protocol stacks
+   require ongoing maintenance to address bugs, performance issues, and
+   vulnerabilities.
+
+   To address this redundancy, this specification defines the method of
+   running HTTP/3 over QMux version 1 [QMUX], which enables the
+   operation of HTTP/3 over TCP and TLS without any modifications.
+
+   Consequently, design, implementation, and maintenance efforts can
+   concentrate on a single HTTP version: HTTP/3.
+
+2.  Conventions and Definitions
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+   "OPTIONAL" in this document are to be interpreted as described in
+   BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+   capitals, as shown here.
+
+3.  The Protocol
+
+   HTTP/3 functions over QUIC version 1, employing the set of operations
+   (i.e., API) defined in Section 2.4 and Section 5.3 of [QUIC].  HTTP/3
+   over QMux version 1 utilizes the same set of operations that are
+   available in QMux.
+
+3.1.  QPACK Considerations
+
+   HTTP/3 uses QPACK [QPACK] for field compression as described in
+   Section 4.2.1 of [HTTP/3].  QPACK is designed to operate over QUIC
+   version 1, which does not provide guarantees of global ordering
+   across streams.  It provides flexibility for implementations to
+   balance resilience against head-of-line blocking and optimal
+   compression ratio (Section 2.1.2 of [QPACK]).
+
+   QMux version 1 operates on top of a transport layer that guarantees
+   in-order delivery and guarantees global ordering across streams.
+   When HTTP/3 over QMux is used, QPACK decoders will never be blocked
+   due to packet losses.  To improve compression efficiency, QPACK
+   encoders can reference a dynamic table entry as soon as the entry is
+   emitted to the underlying transport, regardless of the
+   SETTINGS_QPACK_BLOCKED_STREAMS value advertised by the peer.
+
+4.  Starting HTTP/3 over QMux
+
+   HTTP/3 over QMux version 1 can be used for “https” URI schemes
+   defined in Section 4.2 of [HTTP] with the same default port number as
+   HTTP/1.1 [HTTP/1.1].
+
+
+
+Oku, et al.             Expires 28 December 2026                [Page 3]
+
+Internet-Draft              HTTP/3 over QMux                   June 2026
+
+
+   When a client uses HTTP/3 over QMux for an "https" URI scheme, it
+   uses TLS [TLS] with ALPN [ALPN] as described in Section 8 of [QMUX].
+   The ALPN ID for the final, published RFC is "h3qx".  Until such an
+   RFC exists, implementations MUST NOT identify themselves using this
+   string.
+
+4.1.  Draft Version Identification
+
+   [[RFC editor: please remove this section before publication.]]
+
+   This draft describes HTTP/3 over draft version of QMux.  In order to
+   support interoperability over revisions, HTTP/3 over QMux drafts
+   define an ALPN ID that captures both this document revision and the
+   QMux revision in use.
+
+   The ALPN ID defined by this draft revision is "h3qx-01", which
+   represents HTTP/3 over draft-ietf-quic-qmux-01.
+
+5.  Security Considerations
+
+   The security considerations from Section 10 of [HTTP/3] and
+   Section 12 of [QMUX] apply.
+
+6.  IANA Considerations
+
+   If this document is adopted and published as an RFC, it will have an
+   action to create a new registration for the identification of HTTP/3
+   over QMux version 1 in the "TLS Application-Layer Protocol
+   Negotiation (ALPN) Protocol IDs" registry established in [ALPN].
+
+7.  References
+
+7.1.  Normative References
+
+   [ALPN]     Friedl, S., Popov, A., Langley, A., and E. Stephan,
+              "Transport Layer Security (TLS) Application-Layer Protocol
+              Negotiation Extension", RFC 7301, DOI 10.17487/RFC7301,
+              July 2014, <https://www.rfc-editor.org/rfc/rfc7301>.
+
+   [HTTP]     Fielding, R., Ed., Nottingham, M., Ed., and J. Reschke,
+              Ed., "HTTP Semantics", STD 97, RFC 9110,
+              DOI 10.17487/RFC9110, June 2022,
+              <https://www.rfc-editor.org/rfc/rfc9110>.
+
+   [HTTP/1.1] Fielding, R., Ed., Nottingham, M., Ed., and J. Reschke,
+              Ed., "HTTP/1.1", STD 99, RFC 9112, DOI 10.17487/RFC9112,
+              June 2022, <https://www.rfc-editor.org/rfc/rfc9112>.
+
+
+
+
+Oku, et al.             Expires 28 December 2026                [Page 4]
+
+Internet-Draft              HTTP/3 over QMux                   June 2026
+
+
+   [HTTP/3]   Bishop, M., Ed., "HTTP/3", RFC 9114, DOI 10.17487/RFC9114,
+              June 2022, <https://www.rfc-editor.org/rfc/rfc9114>.
+
+   [QMUX]     Oku, K., Pardue, L., Iyengar, J., and E. Kinnear, "QMux",
+              Work in Progress, Internet-Draft, draft-ietf-quic-qmux-01,
+              1 April 2026, <https://datatracker.ietf.org/doc/html/
+              draft-ietf-quic-qmux-01>.
+
+   [QPACK]    Krasic, C., Bishop, M., and A. Frindell, Ed., "QPACK:
+              Field Compression for HTTP/3", RFC 9204,
+              DOI 10.17487/RFC9204, June 2022,
+              <https://www.rfc-editor.org/rfc/rfc9204>.
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <https://www.rfc-editor.org/rfc/rfc2119>.
+
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
+              2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
+              May 2017, <https://www.rfc-editor.org/rfc/rfc8174>.
+
+   [TLS]      Rescorla, E., "The Transport Layer Security (TLS) Protocol
+              Version 1.3", RFC 8446, DOI 10.17487/RFC8446, August 2018,
+              <https://www.rfc-editor.org/rfc/rfc8446>.
+
+7.2.  Informative References
+
+   [HTTP/2]   Thomson, M., Ed. and C. Benfield, Ed., "HTTP/2", RFC 9113,
+              DOI 10.17487/RFC9113, June 2022,
+              <https://www.rfc-editor.org/rfc/rfc9113>.
+
+   [QUIC]     Iyengar, J., Ed. and M. Thomson, Ed., "QUIC: A UDP-Based
+              Multiplexed and Secure Transport", RFC 9000,
+              DOI 10.17487/RFC9000, May 2021,
+              <https://www.rfc-editor.org/rfc/rfc9000>.
+
+Acknowledgments
+
+   TODO acknowledge.
+
+Authors' Addresses
+
+   Kazuho Oku
+   Fastly
+   Email: kazuhooku@gmail.com
+
+
+
+
+
+Oku, et al.             Expires 28 December 2026                [Page 5]
+
+Internet-Draft              HTTP/3 over QMux                   June 2026
+
+
+   Lucas Pardue
+   Cloudflare
+   Email: lucas@lucaspardue.com
+
+
+   Jana Iyengar
+   Netflix
+   Email: jri.ietf@gmail.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Oku, et al.             Expires 28 December 2026                [Page 6]

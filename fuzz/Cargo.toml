@@ -1,0 +1,50 @@
+[package]
+name = "shiguredo_qmux-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_qmux_receive"
+path = "fuzz_targets/fuzz_qmux_receive.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_frame_decode"
+path = "fuzz_targets/fuzz_frame_decode.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_record_decode"
+path = "fuzz_targets/fuzz_record_decode.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_transport_params_decode"
+path = "fuzz_targets/fuzz_transport_params_decode.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_varint_decode"
+path = "fuzz_targets/fuzz_varint_decode.rs"
+test = false
+
+[dependencies]
+# cargo-fuzz 用の libFuzzer ハーネス
+libfuzzer-sys = "0.4"
+# fuzz 対象の QMux Sans I/O コア
+shiguredo_qmux = { path = ".." }

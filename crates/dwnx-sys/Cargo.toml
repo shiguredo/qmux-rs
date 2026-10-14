@@ -1,0 +1,25 @@
+[package]
+name = "dwnx-sys"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+links = "dwnx"
+publish = false
+
+# 以降は外部ライブラリビルド用のメタデータ
+# (この内容は build.rs の中からのみ参照される)
+[package.metadata.external-dependencies]
+dwnx = { git = "https://github.com/ngtcp2/dwnx.git", ref = "3941ae176af6aa8f878a83d082ad099101b6de2a" }
+
+[lib]
+# bindings.rs は自動生成されたファイルで C のコード例を含むため doctest を無効化
+doctest = false
+
+[build-dependencies]
+# dwnx.h から Rust の FFI 宣言を生成する
+bindgen = "0.72"
+# libdwnx (C11、外部依存なし) をコンパイルする
+cc = "1"
+# 外部依存のビルド設定を読み込む
+shiguredo_toml = "2026.2"

@@ -1,0 +1,16 @@
+[package]
+name = "tokio-dwnx"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# dwnx の安全な Sans I/O ラッパー
+dwnx-rs = { path = "../dwnx-rs" }
+# 非同期ランタイム
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+# テストで #[tokio::test] と duplex / net を使う
+tokio = { version = "1.53", features = ["full"] }

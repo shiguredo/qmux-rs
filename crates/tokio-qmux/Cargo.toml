@@ -1,0 +1,16 @@
+[package]
+name = "tokio-qmux"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Sans I/O の QMux 実装
+shiguredo_qmux = { path = "../.." }
+# 非同期ランタイム
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+# テストで #[tokio::test] と duplex / net を使う
+tokio = { version = "1.53", features = ["full"] }

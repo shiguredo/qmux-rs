@@ -1,0 +1,29 @@
+[package]
+name = "shiguredo_qmux"
+version = "2026.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Sans I/O QMux implementation"
+readme = "README.md"
+homepage = "https://github.com/shiguredo/qmux-rs"
+repository = "https://github.com/shiguredo/qmux-rs"
+license = "Apache-2.0"
+include = ["/src/**", "LICENSE", "README.md"]
+
+[workspace]
+members = [
+  "crates/dwnx-rs",
+  "crates/dwnx-sys",
+  "crates/tokio-dwnx",
+  "crates/tokio-qmux",
+  "interop",
+  "pbt",
+]
+# fuzz は nightly と cargo-fuzz で独立にビルドするためワークスペースから除外する
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]

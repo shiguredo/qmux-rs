@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+  # 追加した検証を手動で実行して確認するために使う
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: CI
+    strategy:
+      matrix:
+        os:
+          # dwnx-sys のビルドで C コンパイラと libclang が必要なため ubuntu-slim は使わない
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+          - macos-26
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # rust-toolchain.toml に固定した MSRV のツールチェーンを導入する
+      - run: rustup show
+      # dwnx-sys は bindgen で FFI 宣言を生成するため libclang が必要
+      - name: Install libclang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+          echo "LIBCLANG_PATH=$(dirname "$(find /usr/lib -name 'libclang.so*' | head -n 1)")" >> "$GITHUB_ENV"
+      - name: Configure libclang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          if [ -z "${LIBCLANG_PATH:-}" ]; then
+            # libclang.dylib の場所は Xcode のバージョンや CLT の有無で変わるため、実在するディレクトリを探す
+            for dir in \
+              /Library/Developer/CommandLineTools/usr/lib \
+              "$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" \
+              "$(xcode-select -p)/usr/lib"; do
+              if [ -f "$dir/libclang.dylib" ]; then
+                echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"
+                break
+              fi
+            done
+          fi
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # fuzz クレートは nightly と cargo-fuzz で独立にビルドするためワークスペースから除外している
+      - name: Check fuzz crate
+        if: matrix.os == 'ubuntu-26.04'
+        run: |
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+          cargo check --manifest-path fuzz/Cargo.toml
+
+  slack_notify:
+    needs: [ci]
+    runs-on: ubuntu-slim
+    if: ${{ always() }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Slack Notification
+        uses: shiguredo/github-actions/.github/actions/slack-notify@main
+        with:
+          status: ${{ job.status }}
+          slack_channel: rust-oss
+          slack_webhook: ${{ secrets.SLACK_WEBHOOK }}
+          notify_mode: failure_and_fixed
+        env:
+          GH_TOKEN: ${{ github.token }}

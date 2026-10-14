@@ -1,0 +1,80 @@
+fail_fast = true
+default_install_hook_types = ["pre-commit", "pre-push"]
+# refs/ は一次資料 (RFC / draft の原文パース) を格納するため、フックによる自動修正の対象から除外する
+exclude = { glob = ["target/**", "fuzz/target/**", "refs/**"] }
+
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-toml" },
+  { id = "check-merge-conflict" },
+  { id = "check-case-conflict" },
+  { id = "check-added-large-files" },
+  { id = "detect-private-key" },
+  { id = "mixed-line-ending" },
+]
+
+# tombi: TOML のフォーマッタ・リンタ
+# rev は prek auto-update で更新する
+[[repos]]
+repo = "https://github.com/tombi-toml/tombi-pre-commit"
+rev = "v1.7.1"
+hooks = [
+  # Cargo.lock は自動生成ファイルなので tombi の対象外にする
+  { id = "tombi-lint", exclude = { glob = "**/Cargo.lock" } },
+  { id = "tombi-format", exclude = { glob = "**/Cargo.lock" } },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+  {
+    id = "cargo-fmt",
+    name = "cargo fmt",
+    entry = "cargo fmt --all -- --check",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false,
+    priority = 0,
+  },
+  {
+    id = "cargo-fmt-fuzz",
+    name = "cargo fmt (fuzz)",
+    entry = "cargo fmt --manifest-path fuzz/Cargo.toml -- --check",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false,
+    priority = 0,
+  },
+  {
+    id = "cargo-clippy",
+    name = "cargo clippy",
+    entry = "cargo clippy --workspace --all-targets -- -D warnings",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false,
+    priority = 10,
+  },
+  {
+    id = "cargo-test",
+    name = "cargo test",
+    entry = "cargo test --workspace",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false,
+    stages = ["pre-push"],
+    priority = 20,
+  },
+  {
+    id = "cargo-check-fuzz",
+    name = "cargo check (fuzz)",
+    entry = "cargo check --manifest-path fuzz/Cargo.toml",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false,
+    stages = ["pre-push"],
+    priority = 20,
+  },
+]

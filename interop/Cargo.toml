@@ -1,0 +1,22 @@
+[package]
+name = "interop"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+# 検証対象の dwnx 実装 (Sans I/O)
+dwnx-rs = { path = "../crates/dwnx-rs" }
+# テスト用の自己署名証明書
+rcgen = "0.14"
+# TLS と ALPN の検証 (rustls + aws-lc-sys)
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+# 検証対象の QMux 実装
+shiguredo_qmux = { path = ".." }
+# テスト用非同期ランタイム
+tokio = { version = "1.53", features = ["full"] }
+tokio-dwnx = { path = "../crates/tokio-dwnx" }
+# 非同期 I/O ありの検証
+tokio-qmux = { path = "../crates/tokio-qmux" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }

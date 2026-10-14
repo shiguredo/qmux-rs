@@ -1,0 +1,12 @@
+[package]
+name = "dwnx-rs"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# dwnx の FFI バインディング
+dwnx-sys = { path = "../dwnx-sys" }
+# dwnx の rand コールバックに渡す乱数
+getrandom = "0.3"
