@@ -7,7 +7,7 @@ use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::Duration;
 use shiguredo_qmux::config::Config;
 use shiguredo_qmux::event::CloseReason;
-use tokio_qmux::{Connection, RecvStream};
+use tokio_qmux::{Connection, Error, RecvStream};
 
 /// テスト用の設定
 fn config() -> Config {
@@ -150,6 +150,57 @@ async fn write_waits_for_flow_control_and_keeps_data() {
         received, payload,
         "フロー制御で分割されてもデータが欠けないこと"
     );
+}
+
+#[tokio::test]
+async fn peer_stop_sending_is_reported_to_send_stream() {
+    let (client, mut server) = pair();
+
+    // クライアントが双方向ストリームを開き、データを送ってサーバーにストリームを作らせる
+    let (mut send, _recv) = client.open_bidirectional().await.expect("開ける");
+    send.write(b"hello").await.expect("書き込める");
+    let (_send, mut recv) = server
+        .accept_bidirectional()
+        .await
+        .expect("accept に失敗しない")
+        .expect("ストリームが届く");
+
+    // サーバーが受信側から送信停止を要求する (STOP_SENDING)
+    recv.stop_sending(0x99)
+        .await
+        .expect("STOP_SENDING を送れる");
+
+    // クライアントの送信側でピアの STOP_SENDING を観測できる
+    assert_eq!(
+        send.stopped().await.expect("STOP_SENDING を観測できる"),
+        0x99,
+        "ピアが指定したエラーコードが通知されること"
+    );
+}
+
+#[tokio::test]
+async fn write_after_stop_sending_fails_with_stopped() {
+    let (client, mut server) = pair();
+
+    let (mut send, _recv) = client.open_bidirectional().await.expect("開ける");
+    send.write(b"hello").await.expect("書き込める");
+    let (_send, mut recv) = server
+        .accept_bidirectional()
+        .await
+        .expect("accept に失敗しない")
+        .expect("ストリームが届く");
+
+    recv.stop_sending(0x7).await.expect("STOP_SENDING を送れる");
+
+    // ピアの送信停止を観測してから、送信側が終端していることを確認する
+    assert_eq!(
+        send.stopped().await.expect("STOP_SENDING を観測できる"),
+        0x7
+    );
+    match send.write(b"ignored").await {
+        Err(Error::Stopped(code)) => assert_eq!(code, 0x7, "エラーコードが一致すること"),
+        other => panic!("Stopped を期待したが {other:?} だった"),
+    }
 }
 
 #[tokio::test]

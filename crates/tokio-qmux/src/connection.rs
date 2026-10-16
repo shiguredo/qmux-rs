@@ -16,7 +16,7 @@ use shiguredo_qmux::event::{CloseReason, Event};
 use shiguredo_qmux::stream::{ReadResult, StreamId};
 
 use crate::error::{Error, Result};
-use crate::stream::{RecvStream, SendStream, StreamEvent};
+use crate::stream::{RecvStream, SendEvent, SendStream, StreamEvent};
 
 /// アプリケーションからドライバへのコマンド
 #[derive(Debug)]
@@ -75,8 +75,10 @@ const CLOSE_CAPACITY: usize = 1;
 const ACCEPT_CAPACITY: usize = 16;
 /// 受信 DATAGRAM の保持数の上限
 const DATAGRAM_CAPACITY: usize = 64;
-/// ストリームごとの受信イベントチャネルの容量
-const RECV_CAPACITY: usize = 16;
+/// ストリームごとのイベントチャネルの容量
+///
+/// 受信側と送信側でそれぞれ 1 本のチャネルを使う。
+const STREAM_EVENT_CAPACITY: usize = 16;
 /// 下位トランスポートから一度に読み取るバイト数の上限
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -136,6 +138,7 @@ impl Connection {
             datagram_tx,
             closed_tx,
             recv_streams: BTreeMap::new(),
+            send_streams: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
             pending_readable: BTreeSet::new(),
             pending_commands: VecDeque::new(),
@@ -271,6 +274,10 @@ struct Driver {
     closed_tx: watch::Sender<Option<CloseReason>>,
     /// ストリーム ID から受信イベント送信への対応
     recv_streams: BTreeMap<StreamId, mpsc::Sender<StreamEvent>>,
+    /// ストリーム ID から送信イベント送信への対応
+    ///
+    /// ピアの STOP_SENDING を送信側ハンドルへ通知するために使う。
+    send_streams: BTreeMap<StreamId, mpsc::Sender<SendEvent>>,
     /// フロー制御で保留している送信データ (ストリームごとの FIFO)
     pending_writes: BTreeMap<StreamId, VecDeque<PendingWrite>>,
     /// 読み取り容量が空くのを待っているストリーム
@@ -430,9 +437,10 @@ impl Driver {
                     self.recv_streams.remove(&id);
                     self.pending_readable.remove(&id);
                 }
-                Event::StreamStopSending { .. } => {
-                    // STOP_SENDING を受けたストリームへの書き込みは、次の
-                    // conn.write が STREAM_STATE_ERROR を返した時点で打ち切られる
+                Event::StreamStopSending { id, error_code } => {
+                    // ピアの STOP_SENDING を送信側ハンドルへ通知し、送信待ちの
+                    // データを破棄する
+                    self.on_stop_sending(id, error_code);
                 }
                 Event::Datagram(data) => {
                     // 保持量に上限があるため、あふれた DATAGRAM は破棄する
@@ -454,25 +462,49 @@ impl Driver {
     /// ピア起動のストリームをアプリケーションへ渡す
     fn on_stream_opened(&mut self, id: StreamId) {
         if id.stream_type().is_bidirectional() {
-            let send = SendStream::new(id, self.command_tx.clone());
+            let send = self.register_send(id);
             let recv = self.register_recv(id);
             if self.accept_bidirectional_tx.try_send((send, recv)).is_err() {
                 // アプリケーションが受け取らないまま接続が閉じた場合など
+                self.send_streams.remove(&id);
                 self.recv_streams.remove(&id);
             }
         } else {
             let recv = self.register_recv(id);
+            // 単方向ストリームにはこちらから送信しないため送信側は作らない
             if self.accept_unidirectional_tx.try_send(recv).is_err() {
                 self.recv_streams.remove(&id);
             }
         }
     }
 
+    /// 送信イベントチャネルを登録してハンドルを返す
+    fn register_send(&mut self, id: StreamId) -> SendStream {
+        let (tx, rx) = mpsc::channel(STREAM_EVENT_CAPACITY);
+        self.send_streams.insert(id, tx);
+        SendStream::new(id, self.command_tx.clone(), rx)
+    }
+
     /// 受信イベントチャネルを登録してハンドルを返す
     fn register_recv(&mut self, id: StreamId) -> RecvStream {
-        let (tx, rx) = mpsc::channel(RECV_CAPACITY);
+        let (tx, rx) = mpsc::channel(STREAM_EVENT_CAPACITY);
         self.recv_streams.insert(id, tx);
         RecvStream::new(id, rx, self.command_tx.clone())
+    }
+
+    /// ピアの STOP_SENDING を送信側ハンドルへ通知する
+    ///
+    /// 送信側はピアが送信停止を要求した時点で終端する (RFC 9000 Section 3.5)。
+    /// 送信待ちのデータを破棄し、送信側ハンドルへエラーコードを配送する。
+    fn on_stop_sending(&mut self, id: StreamId, error_code: u64) {
+        if let Some(tx) = self.send_streams.remove(&id) {
+            let _ = tx.try_send(SendEvent::StopSending(error_code));
+        }
+        if let Some(queue) = self.pending_writes.remove(&id) {
+            for pending in queue {
+                let _ = pending.ack.send(Err(Error::Stopped(error_code)));
+            }
+        }
     }
 
     /// フロー制御で保留している書き込みを再試行する
@@ -495,7 +527,11 @@ impl Driver {
                 match self.connection.write(id, &pending.data, pending.fin) {
                     Ok(len) => {
                         if len == pending.data.len() {
-                            // 全データ (FIN 指定時は FIN も) を送り終えた
+                            // 全データ (FIN 指定時は FIN も) を送り終えた。
+                            // 送信側が完了したため、STOP_SENDING の通知先を破棄する
+                            if pending.fin {
+                                self.send_streams.remove(&id);
+                            }
                             let _ = pending.ack.send(Ok(()));
                         } else if len == 0 {
                             // フロー制御で送れない。このチャンクを戻して打ち切る
@@ -610,17 +646,14 @@ impl Driver {
         match command {
             Command::OpenBidirectional(reply) => {
                 let result = self.connection.open_bidi().map(|id| {
-                    let send = SendStream::new(id, self.command_tx.clone());
+                    let send = self.register_send(id);
                     let recv = self.register_recv(id);
                     (send, recv)
                 });
                 let _ = reply.send(result.map_err(Error::Qmux));
             }
             Command::OpenUnidirectional(reply) => {
-                let result = self
-                    .connection
-                    .open_uni()
-                    .map(|id| SendStream::new(id, self.command_tx.clone()));
+                let result = self.connection.open_uni().map(|id| self.register_send(id));
                 let _ = reply.send(result.map_err(Error::Qmux));
             }
             Command::Write { id, data, fin, ack } => {
@@ -640,6 +673,8 @@ impl Driver {
                         let _ = pending.ack.send(Err(Error::ConnectionClosed));
                     }
                 }
+                // 送信側をリセットすると STOP_SENDING の通知先は不要になる
+                self.send_streams.remove(&id);
                 let result = self.connection.reset(id, error_code).map_err(Error::Qmux);
                 let _ = ack.send(result);
             }
@@ -666,6 +701,7 @@ impl Driver {
             .unwrap_or(CloseReason::TransportClosed);
         let _ = self.closed_tx.send(Some(reason));
         self.recv_streams.clear();
+        self.send_streams.clear();
         self.pending_writes.clear();
     }
 }
