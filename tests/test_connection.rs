@@ -837,6 +837,26 @@ mod datagrams {
     }
 
     #[test]
+    fn excess_datagrams_are_counted_as_dropped() {
+        // アプリケーションが poll_event しない状態で保持量の上限 (64) を超えると、
+        // 超えた分は破棄される。破棄した個数を観測できることを検証する。
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        for index in 0..100u32 {
+            pair.client
+                .send_datagram(&index.to_be_bytes())
+                .expect("送信できる");
+        }
+        pair.transfer();
+
+        assert!(
+            pair.server.dropped_datagrams() >= 1,
+            "保持量の上限を超えた DATAGRAM の破棄数が観測できること"
+        );
+    }
+
+    #[test]
     fn datagram_larger_than_peer_limit_is_rejected() {
         let mut server_config = config();
         server_config.max_datagram_frame_size = Some(8);

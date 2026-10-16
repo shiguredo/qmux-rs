@@ -82,6 +82,8 @@ pub struct Connection {
     queued_datagrams: usize,
     /// アプリケーションへ未配送の DATAGRAM の合計バイト数
     queued_datagram_bytes: usize,
+    /// 保持量の上限を超えて破棄した受信 DATAGRAM の累計個数
+    dropped_datagrams: u64,
 }
 
 impl Connection {
@@ -119,6 +121,7 @@ impl Connection {
             last_activity: None,
             queued_datagrams: 0,
             queued_datagram_bytes: 0,
+            dropped_datagrams: 0,
         })
     }
 
@@ -137,6 +140,14 @@ impl Connection {
     /// 受信前は `None` を返す。ストリームと DATAGRAM は受信後に使える。
     pub fn peer_transport_parameters(&self) -> Option<&TransportParameters> {
         self.peer_params.as_ref()
+    }
+
+    /// 保持量の上限を超えて破棄した受信 DATAGRAM の累計個数を返す
+    ///
+    /// QMux Section 6 はアプリケーションへ速やかに配送できない DATAGRAM の破棄を
+    /// 許す。この値は破棄が起きたことをアプリケーションが観測するために使う。
+    pub fn dropped_datagrams(&self) -> u64 {
+        self.dropped_datagrams
     }
 
     /// 接続が閉じたかどうか
@@ -672,6 +683,8 @@ impl Connection {
         if self.queued_datagrams >= MAX_QUEUED_DATAGRAMS
             || self.queued_datagram_bytes + datagram.data.len() > MAX_QUEUED_DATAGRAM_BYTES
         {
+            // 破棄したことをアプリケーションが観測できるように回数を数える
+            self.dropped_datagrams = self.dropped_datagrams.saturating_add(1);
             return Ok(());
         }
 

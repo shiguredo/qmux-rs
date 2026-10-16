@@ -195,7 +195,8 @@ async fn qmux_client_dwnx_server_over_tls() {
         "ALPN がネゴシエートされること"
     );
 
-    let connection = QmuxConnection::new(QmuxRole::Client, tls, qmux_config());
+    let connection =
+        QmuxConnection::new(QmuxRole::Client, tls, qmux_config()).expect("QMux 接続を作成できる");
     let (mut send, mut recv) = connection
         .open_bidirectional()
         .await

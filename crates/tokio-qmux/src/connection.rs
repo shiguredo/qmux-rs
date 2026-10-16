@@ -14,6 +14,7 @@ use shiguredo_qmux::config::Config;
 use shiguredo_qmux::connection::Connection as QmuxConnection;
 use shiguredo_qmux::event::{CloseReason, Event};
 use shiguredo_qmux::stream::{ReadResult, StreamId};
+use shiguredo_qmux::transport_params::TransportParameters;
 
 use crate::error::{Error, Result};
 use crate::stream::{RecvStream, SendEvent, SendStream, StopSendingObserved, StreamEvent};
@@ -115,6 +116,14 @@ pub struct Connection {
     ///
     /// `accept_bidirectional` と同じ理由で Mutex で包む。
     stop_sending: Mutex<mpsc::Receiver<StopSendingObserved>>,
+    /// ピアのトランスポートパラメータの最新値
+    ///
+    /// ドライバが受信時に watch で配る。`&self` でいつでも同期取得できる。
+    peer_params: watch::Receiver<Option<TransportParameters>>,
+    /// 破棄した受信 DATAGRAM の累計個数
+    ///
+    /// Sans I/O 側と tokio 側の破棄を合算した値をドライバが watch で配る。
+    dropped_datagrams: watch::Receiver<u64>,
     /// 接続が閉じた理由
     closed: watch::Receiver<Option<CloseReason>>,
 }
@@ -126,11 +135,13 @@ impl Connection {
     /// テスト用の duplex など) を渡す。TLS と ALPN のネゴシエーションは呼び出し側の
     /// 責務である。tokio ランタイムのコンテキストで呼び出すこと。
     ///
-    /// # Panics
+    /// # エラー
     ///
-    /// `config` が送信できない設定 (`max_record_size` が既定値未満など) の場合、
-    /// 内部の Sans I/O 接続の作成に失敗し panic する。
-    pub fn new<T>(role: Role, io: T, config: Config) -> Self
+    /// `config` が送信できない設定 (`max_record_size` が既定値未満など) の場合は
+    /// [`Error::Qmux`] を返す。`Config::default()` はフロー制御のクレジットが 0 で
+    /// DATAGRAM も無効なため、ストリームや DATAGRAM を使う場合は明示的に設定する
+    /// こと。
+    pub fn new<T>(role: Role, io: T, config: Config) -> Result<Self>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -141,10 +152,15 @@ impl Connection {
         let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_CAPACITY);
         let (stop_sending_tx, stop_sending_rx) = mpsc::channel(STOP_SENDING_CAPACITY);
         let (closed_tx, closed_rx) = watch::channel(None);
+        let (peer_params_tx, peer_params_rx) = watch::channel(None);
+        let (dropped_datagrams_tx, dropped_datagrams_rx) = watch::channel(0);
+
+        // 送信できない設定はここでエラーにする。誤設定を最初の送信まで遅延させない。
+        let connection = QmuxConnection::new(role, config)?;
 
         let (reader, writer) = tokio::io::split(io);
         let driver = Driver {
-            connection: QmuxConnection::new(role, config).expect("QMux 接続を作成できる"),
+            connection,
             reader: Box::new(reader),
             writer: Box::new(writer),
             command_rx,
@@ -154,6 +170,8 @@ impl Connection {
             accept_unidirectional_tx,
             datagram_tx,
             stop_sending_tx,
+            peer_params_tx,
+            dropped_datagrams_tx,
             closed_tx,
             recv_streams: BTreeMap::new(),
             send_streams: BTreeMap::new(),
@@ -161,6 +179,7 @@ impl Connection {
             pending_readable: BTreeSet::new(),
             pending_commands: VecDeque::new(),
             pending_stop_sending: VecDeque::new(),
+            datagram_drops: 0,
             established: false,
             read_scratch: vec![0u8; READ_BUFFER_SIZE],
             started: std::time::Instant::now(),
@@ -169,15 +188,17 @@ impl Connection {
         };
         tokio::spawn(driver.run());
 
-        Self {
+        Ok(Self {
             commands,
             close_request,
             accept_bidirectional: Mutex::new(accept_bidirectional_rx),
             accept_unidirectional: Mutex::new(accept_unidirectional_rx),
             datagrams: Mutex::new(datagram_rx),
             stop_sending: Mutex::new(stop_sending_rx),
+            peer_params: peer_params_rx,
+            dropped_datagrams: dropped_datagrams_rx,
             closed: closed_rx,
-        }
+        })
     }
 
     /// 双方向ストリームを開く
@@ -202,8 +223,13 @@ impl Connection {
 
     /// ピア起動の双方向ストリームを受け取る
     ///
-    /// 接続が閉じた場合は `Ok(None)` を返す。`&self` で待てるため、[`Arc`] で
+    /// 接続が閉じた場合は `Ok(None)` を返す。`&self` で待てるため、[`std::sync::Arc`] で
     /// 共有した接続や、他の accept 系と同時に `select!` して待つことができる。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// まだ受け取っていないストリームは失われない。`select!` の腕に置いてよい。
     pub async fn accept_bidirectional(&self) -> Result<Option<(SendStream, RecvStream)>> {
         Ok(self.accept_bidirectional.lock().await.recv().await)
     }
@@ -212,6 +238,11 @@ impl Connection {
     ///
     /// 接続が閉じた場合は `Ok(None)` を返す。[`Self::accept_bidirectional`] と同様に
     /// `&self` で待てる。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。まだ受け取っていないストリームは、
+    /// 待っている間に future を破棄しても失われない。
     pub async fn accept_unidirectional(&self) -> Result<Option<RecvStream>> {
         Ok(self.accept_unidirectional.lock().await.recv().await)
     }
@@ -228,8 +259,35 @@ impl Connection {
     ///
     /// 接続が閉じた場合は `Ok(None)` を返す。[`Self::accept_bidirectional`] と
     /// 同様に `&self` で待てる。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// まだ受け取っていない DATAGRAM は失われない。
     pub async fn recv_datagram(&self) -> Result<Option<Vec<u8>>> {
         Ok(self.datagrams.lock().await.recv().await)
+    }
+
+    /// 到着済みの DATAGRAM をまとめて受け取る
+    ///
+    /// 1 件以上届くまで待ち、その時点で受け取れる分をすべてまとめて返す。返る
+    /// `Vec` は空にならない。接続が閉じた場合は `Ok(None)` を返す。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。最初の DATAGRAM を待っている間に future を
+    /// 破棄しても、まだ受け取っていない DATAGRAM は失われない。2 件目以降の取り出しは
+    /// await を挟まずに行うため、途中で破棄されることはない。
+    pub async fn recv_datagrams(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        let mut datagrams = self.datagrams.lock().await;
+        let Some(first) = datagrams.recv().await else {
+            return Ok(None);
+        };
+        let mut batch = vec![first];
+        while let Ok(datagram) = datagrams.try_recv() {
+            batch.push(datagram);
+        }
+        Ok(Some(batch))
     }
 
     /// ピアが要求した送信停止を受け取る (STOP_SENDING)
@@ -241,8 +299,31 @@ impl Connection {
     ///
     /// [`SendStream::stopped`] が返すのと同じ通知を接続単位で受け取る入り口である。
     /// ストリーム単位か接続単位かは、アプリケーションのタスク構成に応じて選ぶ。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// まだ受け取っていない通知は失われない。
     pub async fn recv_stop_sending(&self) -> Result<Option<StopSendingObserved>> {
         Ok(self.stop_sending.lock().await.recv().await)
+    }
+
+    /// ピアのトランスポートパラメータを返す
+    ///
+    /// ピアから受信する前は `None` を返す。DATAGRAM を送れるかどうかは
+    /// `max_datagram_frame_size`、フロー制御の上限は `initial_max_data` などで確認
+    /// できる (RFC 9221 Section 3、RFC 9000 Section 18.2)。
+    pub fn peer_transport_parameters(&self) -> Option<TransportParameters> {
+        self.peer_params.borrow().clone()
+    }
+
+    /// 破棄した受信 DATAGRAM の累計個数を返す
+    ///
+    /// Sans I/O 側のキュー上限と tokio 側のチャネル上限を合算した値である。
+    /// QMux Section 6 は速やかに配送できない DATAGRAM の破棄を許すため、この値で
+    /// 取りこぼしを検知できる。
+    pub fn dropped_datagrams(&self) -> u64 {
+        *self.dropped_datagrams.borrow()
     }
 
     /// QX_PING を送信し、シーケンス番号を返す
@@ -272,6 +353,11 @@ impl Connection {
     }
 
     /// 接続が閉じるまで待ち、理由を返す
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// その間に閉じた理由を取り逃がすことはない (内部の watch に保持される)。
     pub async fn closed(&self) -> CloseReason {
         let mut closed = self.closed.clone();
         loop {
@@ -308,6 +394,10 @@ struct Driver {
     datagram_tx: mpsc::Sender<Vec<u8>>,
     /// 接続単位の STOP_SENDING 通知の受け渡し
     stop_sending_tx: mpsc::Sender<StopSendingObserved>,
+    /// ピアのトランスポートパラメータの通知
+    peer_params_tx: watch::Sender<Option<TransportParameters>>,
+    /// 破棄した受信 DATAGRAM の累計個数の通知
+    dropped_datagrams_tx: watch::Sender<u64>,
     /// 接続が閉じた理由の通知
     closed_tx: watch::Sender<Option<CloseReason>>,
     /// ストリーム ID から受信イベント送信への対応
@@ -324,6 +414,8 @@ struct Driver {
     pending_commands: VecDeque<Command>,
     /// 接続単位の通知チャネルが埋まっているため保留している STOP_SENDING
     pending_stop_sending: VecDeque<StopSendingObserved>,
+    /// tokio 側のチャネルが埋まって破棄した DATAGRAM の累計個数
+    datagram_drops: u64,
     /// ピアのトランスポートパラメータを受信済みかどうか
     established: bool,
     /// ストリーム読み取り用の作業バッファ
@@ -363,6 +455,7 @@ impl Driver {
 
         loop {
             self.process_events();
+            self.update_datagram_drops();
             self.retry_stop_sending();
             if self.close_reason.is_none() {
                 self.retry_readable();
@@ -372,6 +465,7 @@ impl Driver {
                 self.connection.transport_closed();
                 self.transport_ended = true;
                 self.process_events();
+                self.update_datagram_drops();
                 self.retry_stop_sending();
             }
             // 自分から閉じた場合は、CONNECTION_CLOSE を送った後にピアの
@@ -459,12 +553,30 @@ impl Driver {
         })
     }
 
+    /// 破棄した DATAGRAM の累計個数をアプリケーションへ通知する
+    ///
+    /// Sans I/O 側のキュー上限による破棄と tokio 側のチャネル上限による破棄を
+    /// 合算する。値が変わったときだけ送る。
+    fn update_datagram_drops(&self) {
+        let total = self
+            .datagram_drops
+            .saturating_add(self.connection.dropped_datagrams());
+        if *self.dropped_datagrams_tx.borrow() != total {
+            let _ = self.dropped_datagrams_tx.send(total);
+        }
+    }
+
     /// 接続のイベントを取り出して処理する
     fn process_events(&mut self) {
         while let Some(event) = self.connection.poll_event() {
             match event {
                 Event::TransportParametersReceived => {
                     self.established = true;
+                    // アプリケーションがピアのフロー制御の値と DATAGRAM 対応を確認
+                    // できるよう、受信したパラメータの最新値を配る
+                    let _ = self
+                        .peer_params_tx
+                        .send(self.connection.peer_transport_parameters().cloned());
                     self.flush_pending_commands();
                 }
                 Event::StreamOpened { id } => self.on_stream_opened(id),
@@ -486,8 +598,11 @@ impl Driver {
                 }
                 Event::Datagram(data) => {
                     // 保持量に上限があるため、あふれた DATAGRAM は破棄する
-                    // (draft-ietf-quic-qmux-02 Section 6)
-                    let _ = self.datagram_tx.try_send(data);
+                    // (draft-ietf-quic-qmux-02 Section 6)。破棄した個数は
+                    // アプリケーションが観測できるように数えておく。
+                    if self.datagram_tx.try_send(data).is_err() {
+                        self.datagram_drops = self.datagram_drops.saturating_add(1);
+                    }
                 }
                 Event::Ping { .. } => {}
                 Event::PingAcknowledged { .. } => {}

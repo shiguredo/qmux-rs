@@ -7,8 +7,27 @@
 //! 駆動する。アプリケーションは [`SendStream`] / [`RecvStream`] と DATAGRAM の
 //! ハンドル越しに操作する。
 //!
-//! TLS と ALPN のネゴシエーションは呼び出し側の責務である。`Connection::new` には
+//! 複数タスクからの利用を想定し、待ち受ける系のメソッド ([`Connection::accept_bidirectional`]、
+//! [`Connection::accept_unidirectional`]、[`Connection::recv_datagram`]、
+//! [`Connection::recv_datagrams`]、[`Connection::recv_stop_sending`]、
+//! [`Connection::closed`]) は `&self` を取り、`select!` の腕に置いても安全な
+//! cancel safety を持つ。
+//!
+//! TLS と ALPN のネゴシエーションは呼び出し側の責務である。[`Connection::new`] には
 //! 接続済みの双方向バイトストリームを渡す。
+//!
+//! # QUIC の上で動かす場合との違い
+//!
+//! QMux は QUIC と API が似ているが、下位が順序保証された単一のバイトストリーム
+//! (TCP など) であるため、振る舞いが異なる。
+//!
+//! - DATAGRAM は信頼的かつ順序どおりに配送される (draft-ietf-quic-qmux-02
+//!   Section 1.1)。QUIC の DATAGRAM (RFC 9221) のような非信頼・順不同配送では
+//!   ない。ただしアプリケーションが速やかに受け取れない場合は破棄されることが
+//!   あり、破棄した個数は [`Connection::dropped_datagrams`] で確認できる
+//! - すべてのストリームが 1 本のバイトストリームを共有するため、トランスポート
+//!   層の head-of-line blocking は解消されない。ストリーム多重化による恩恵は
+//!   QUIC のそれとは異なる
 //!
 //! ```
 //! use shiguredo_qmux::codec::role::Role;
@@ -26,8 +45,8 @@
 //!     ..Config::default()
 //! };
 //! let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-//! let client = Connection::new(Role::Client, client_io, config.clone());
-//! let server = Connection::new(Role::Server, server_io, config);
+//! let client = Connection::new(Role::Client, client_io, config.clone())?;
+//! let server = Connection::new(Role::Server, server_io, config)?;
 //!
 //! let (mut send, _recv) = client.open_bidirectional().await?;
 //! send.write(b"hello").await?;

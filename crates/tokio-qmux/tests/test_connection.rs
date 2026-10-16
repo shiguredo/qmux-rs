@@ -29,8 +29,10 @@ fn config() -> Config {
 /// 接続の組を作る
 fn pair() -> (Connection, Connection) {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let client = Connection::new(Role::Client, client_io, config());
-    let server = Connection::new(Role::Server, server_io, config());
+    let client = Connection::new(Role::Client, client_io, config())
+        .expect("テスト用のクライアント接続を作成できる");
+    let server = Connection::new(Role::Server, server_io, config())
+        .expect("テスト用のサーバー接続を作成できる");
     (client, server)
 }
 
@@ -127,8 +129,10 @@ async fn write_waits_for_flow_control_and_keeps_data() {
     server_config.initial_max_stream_data_bidi_remote = 8;
     server_config.initial_max_data = 8;
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let client = Connection::new(Role::Client, client_io, config());
-    let server = Connection::new(Role::Server, server_io, server_config);
+    let client = Connection::new(Role::Client, client_io, config())
+        .expect("テスト用のクライアント接続を作成できる");
+    let server = Connection::new(Role::Server, server_io, server_config)
+        .expect("テスト用のサーバー接続を作成できる");
 
     // サーバーが読み続けないとクレジットが戻らないため、先に読み取りタスクを立てる。
     let reader = tokio::spawn(async move {
@@ -261,6 +265,85 @@ async fn datagram_is_delivered() {
         .expect("受信に失敗しない")
         .expect("DATAGRAM が届く");
     assert_eq!(received, b"datagram");
+}
+
+#[tokio::test]
+async fn peer_transport_parameters_are_readable_after_handshake() {
+    let (client, _server) = pair();
+
+    // ストリームを開くと、ピアのトランスポートパラメータを受信した後に完了する
+    let (_send, _recv) = client
+        .open_bidirectional()
+        .await
+        .expect("双方向ストリームを開ける");
+
+    let params = client
+        .peer_transport_parameters()
+        .expect("ピアのトランスポートパラメータを取得できる");
+    assert_eq!(
+        params.initial_max_data,
+        64 * 1024,
+        "ピアが広告した initial_max_data が読めること"
+    );
+}
+
+#[tokio::test]
+async fn dropped_datagrams_are_counted() {
+    // サーバーが DATAGRAM を読まないまま大量に送り、tokio 側のチャネル上限に
+    // あふれた分が破棄数として観測できることを検証する。
+    let (client, server) = pair();
+
+    // ハンドシェイクを進める (確立まで DATAGRAM の送信は保留される)
+    let _ = client.open_bidirectional().await.expect("開ける");
+    for index in 0..300u32 {
+        client
+            .send_datagram(&index.to_be_bytes())
+            .await
+            .expect("DATAGRAM を送れる");
+    }
+
+    // すべて処理されたことを切断で同期する
+    client.close(0, "done");
+    server.closed().await;
+
+    assert!(
+        server.dropped_datagrams() > 0,
+        "チャネル上限を超えた DATAGRAM の破棄数が観測できること"
+    );
+}
+
+#[tokio::test]
+async fn recv_datagrams_returns_arrived_datagrams_together() {
+    let (client, server) = pair();
+    let _ = client.open_bidirectional().await.expect("開ける");
+    for payload in [b"a".as_slice(), b"b", b"c"] {
+        client
+            .send_datagram(payload)
+            .await
+            .expect("DATAGRAM を送れる");
+    }
+
+    // 配送が完了したことを切断で同期してからまとめて取り出す
+    client.close(0, "done");
+    server.closed().await;
+    let batch = server
+        .recv_datagrams()
+        .await
+        .expect("受信に失敗しない")
+        .expect("DATAGRAM が届く");
+    assert_eq!(batch.len(), 3, "到着済みの DATAGRAM をまとめて返すこと");
+}
+
+#[tokio::test]
+async fn invalid_config_is_reported_as_error() {
+    // Section 5.2: max_record_size が既定値未満の設定は接続の作成時に拒否する
+    let mut invalid = config();
+    invalid.max_record_size = 1;
+    let (client_io, _server_io) = tokio::io::duplex(64 * 1024);
+    match Connection::new(Role::Client, client_io, invalid) {
+        Err(Error::Qmux(_)) => {}
+        other => panic!("Qmux エラーを期待したが {other:?} だった"),
+    }
 }
 
 #[tokio::test]

@@ -53,6 +53,21 @@ HTTP/3 を QMux 上で動かす場合の ALPN は `h3qx-01`（HTTP/3 over draft-
 
 自己署名証明書は `rcgen` で生成し、クライアントはテスト専用の検証器で受け入れます。
 
+## ALPN 識別子
+
+ALPN 識別子は下位トランスポートの利用者が決めるものであり、`shiguredo_qmux` 自身は
+ALPN を扱いません。QMux 上で動かすアプリケーションプロトコルの識別子は、QUIC 上の
+同じプロトコルと区別できる値にする必要があります (draft-ietf-quic-qmux-02 Section 8.1)。
+
+現在の運用は次のとおりです。
+
+- HTTP/3 over QMux: `h3qx-01` (`draft-kazuho-httpbis-http3-over-qmux-00`)
+  - 相互接続テストはストリームの echo のみを検証するため `hqx-01` を使う
+- MOQT over QMux: `moqt-22`
+  - native (QUIC) と同一の識別子で統一する。Section 8.1 は QMux マッピングに
+    QUIC マッピングと別の識別子を MUST とするため、この点は MOQT 側ドラフトとの
+    間で引き続き整理が必要である
+
 ## 実行
 
 ```bash

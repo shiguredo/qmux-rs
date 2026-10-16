@@ -96,6 +96,9 @@ impl SendStream {
     }
 
     /// ストリームの送信側を閉じる (FIN を送る)
+    ///
+    /// ピアがすでに送信停止を要求している場合は [`Error::Stopped`] を返す
+    /// ([`Self::write`] と同じ)。
     pub async fn finish(&mut self) -> Result<()> {
         self.check_stopped()?;
         if self.finished {
@@ -117,6 +120,9 @@ impl SendStream {
     }
 
     /// ストリームの送信側をリセットする (RESET_STREAM を送る)
+    ///
+    /// ピアがすでに送信停止を要求している場合は [`Error::Stopped`] を返す
+    /// ([`Self::write`] と同じ)。
     pub async fn reset(&mut self, error_code: u64) -> Result<()> {
         self.check_stopped()?;
         if self.finished {
@@ -140,8 +146,18 @@ impl SendStream {
     ///
     /// RFC 9000 Section 19.5 の STOP_SENDING をアプリケーションへ通知する。
     /// ピアが指定したアプリケーションエラーコードを返す。2 回目以降の呼び出しは
-    /// 受信済みのコードを即座に返す。接続が閉じて通知が届かなかった場合は
-    /// [`Error::ConnectionClosed`] を返す。
+    /// 受信済みのコードを即座に返す。
+    ///
+    /// FIN または RESET_STREAM を送信した後は、ドライバが送信側ハンドルを破棄する
+    /// ため、以後の STOP_SENDING はここには届かず [`Error::ConnectionClosed`] を
+    /// 返す。接続が閉じて通知が届かなかった場合も同じである。FIN 後もピアの
+    /// STOP_SENDING を観測したい場合は [`crate::Connection::recv_stop_sending`] を
+    /// 使うこと。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// まだ受け取っていない通知は失われず、次の呼び出しで受け取れる。
     pub async fn stopped(&mut self) -> Result<u64> {
         // すでに通知を受け取っている場合は同じコードを返す
         if let Some(error_code) = self.stop_sending {

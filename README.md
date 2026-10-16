@@ -76,19 +76,22 @@ assert_eq!(server.poll_event(), Some(Event::TransportParametersReceived));
 ### tokio
 
 ```rust
-use tokio_qmux::{Config, Connection, Role};
+use shiguredo_qmux::codec::role::Role;
+use shiguredo_qmux::config::Config;
+use tokio_qmux::Connection;
 
 # async fn example() -> Result<(), tokio_qmux::Error> {
 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-let client = Connection::new(Role::Client, client_io, Config::default());
-let server = Connection::new(Role::Server, server_io, Config::default());
+let client = Connection::new(Role::Client, client_io, Config::default())?;
+let server = Connection::new(Role::Server, server_io, Config::default())?;
 # let _ = (client, server);
 # Ok(())
 # }
 ```
 
 下位トランスポートには接続済みの双方向バイトストリームを渡します。TLS と ALPN の
-ネゴシエーションは呼び出し側の責務です。
+ネゴシエーションは呼び出し側の責務です。実行可能な最小例は
+`crates/tokio-qmux/examples/basic.rs` にあります。
 
 ## テスト
 
