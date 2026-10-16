@@ -3,6 +3,8 @@
 //! `tokio::io::duplex` で接続した 2 つの [`Connection`] を使い、ストリーム、
 //! DATAGRAM、切断を検証する。
 
+use std::sync::Arc;
+
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::Duration;
 use shiguredo_qmux::config::Config;
@@ -47,7 +49,7 @@ async fn read_to_end(recv: &mut RecvStream) -> Vec<u8> {
 
 #[tokio::test]
 async fn bidirectional_stream_transfers_data() {
-    let (client, mut server) = pair();
+    let (client, server) = pair();
 
     let (mut send, _recv) = client
         .open_bidirectional()
@@ -66,7 +68,7 @@ async fn bidirectional_stream_transfers_data() {
 
 #[tokio::test]
 async fn data_split_across_reads_is_reassembled() {
-    let (client, mut server) = pair();
+    let (client, server) = pair();
 
     let (mut send, _recv) = client.open_bidirectional().await.expect("開ける");
     for chunk in [b"abc".as_slice(), b"def", b"ghi"] {
@@ -84,7 +86,7 @@ async fn data_split_across_reads_is_reassembled() {
 
 #[tokio::test]
 async fn unidirectional_stream_transfers_data() {
-    let (client, mut server) = pair();
+    let (client, server) = pair();
 
     let mut send = client
         .open_unidirectional()
@@ -103,7 +105,7 @@ async fn unidirectional_stream_transfers_data() {
 
 #[tokio::test]
 async fn server_can_open_stream_to_client() {
-    let (mut client, server) = pair();
+    let (client, server) = pair();
 
     let (mut send, _recv) = server.open_bidirectional().await.expect("開ける");
     send.write(b"from-server").await.expect("書き込める");
@@ -126,7 +128,7 @@ async fn write_waits_for_flow_control_and_keeps_data() {
     server_config.initial_max_data = 8;
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let client = Connection::new(Role::Client, client_io, config());
-    let mut server = Connection::new(Role::Server, server_io, server_config);
+    let server = Connection::new(Role::Server, server_io, server_config);
 
     // サーバーが読み続けないとクレジットが戻らないため、先に読み取りタスクを立てる。
     let reader = tokio::spawn(async move {
@@ -154,7 +156,7 @@ async fn write_waits_for_flow_control_and_keeps_data() {
 
 #[tokio::test]
 async fn peer_stop_sending_is_reported_to_send_stream() {
-    let (client, mut server) = pair();
+    let (client, server) = pair();
 
     // クライアントが双方向ストリームを開き、データを送ってサーバーにストリームを作らせる
     let (mut send, _recv) = client.open_bidirectional().await.expect("開ける");
@@ -180,7 +182,7 @@ async fn peer_stop_sending_is_reported_to_send_stream() {
 
 #[tokio::test]
 async fn write_after_stop_sending_fails_with_stopped() {
-    let (client, mut server) = pair();
+    let (client, server) = pair();
 
     let (mut send, _recv) = client.open_bidirectional().await.expect("開ける");
     send.write(b"hello").await.expect("書き込める");
@@ -205,7 +207,7 @@ async fn write_after_stop_sending_fails_with_stopped() {
 
 #[tokio::test]
 async fn datagram_is_delivered() {
-    let (client, mut server) = pair();
+    let (client, server) = pair();
 
     client
         .send_datagram(b"datagram")
@@ -217,6 +219,63 @@ async fn datagram_is_delivered() {
         .expect("受信に失敗しない")
         .expect("DATAGRAM が届く");
     assert_eq!(received, b"datagram");
+}
+
+#[tokio::test]
+async fn acceptors_and_datagram_can_be_waited_from_separate_tasks() {
+    // MOQT のように双方向ストリーム・単方向ストリーム・DATAGRAM を別々のタスクで
+    // 待つ利用側を想定し、Arc で共有した接続に対して &self の accept 系を同時に
+    // 待てることを検証する。
+    let (client, server) = pair();
+    let server = Arc::new(server);
+
+    let bidi_server = Arc::clone(&server);
+    let bidi_task = tokio::spawn(async move {
+        bidi_server
+            .accept_bidirectional()
+            .await
+            .expect("accept に失敗しない")
+            .expect("双方向ストリームが届く")
+    });
+    let uni_server = Arc::clone(&server);
+    let uni_task = tokio::spawn(async move {
+        uni_server
+            .accept_unidirectional()
+            .await
+            .expect("accept に失敗しない")
+            .expect("単方向ストリームが届く")
+    });
+    let datagram_server = Arc::clone(&server);
+    let datagram_task = tokio::spawn(async move {
+        datagram_server
+            .recv_datagram()
+            .await
+            .expect("受信に失敗しない")
+            .expect("DATAGRAM が届く")
+    });
+
+    let (mut send, _recv) = client
+        .open_bidirectional()
+        .await
+        .expect("双方向ストリームを開ける");
+    send.write(b"bidi").await.expect("書き込める");
+    send.finish().await.expect("FIN を送れる");
+    let mut send_uni = client
+        .open_unidirectional()
+        .await
+        .expect("単方向ストリームを開ける");
+    send_uni.write(b"uni").await.expect("書き込める");
+    send_uni.finish().await.expect("FIN を送れる");
+    client
+        .send_datagram(b"dgram")
+        .await
+        .expect("DATAGRAM を送れる");
+
+    let (_send, mut recv) = bidi_task.await.expect("タスクが終了する");
+    assert_eq!(read_to_end(&mut recv).await, b"bidi");
+    let mut recv_uni = uni_task.await.expect("タスクが終了する");
+    assert_eq!(read_to_end(&mut recv_uni).await, b"uni");
+    assert_eq!(datagram_task.await.expect("タスクが終了する"), b"dgram");
 }
 
 #[tokio::test]

@@ -27,7 +27,7 @@
 //! };
 //! let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 //! let client = Connection::new(Role::Client, client_io, config.clone());
-//! let mut server = Connection::new(Role::Server, server_io, config);
+//! let server = Connection::new(Role::Server, server_io, config);
 //!
 //! let (mut send, _recv) = client.open_bidirectional().await?;
 //! send.write(b"hello").await?;

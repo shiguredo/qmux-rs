@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::Timestamp;
@@ -94,11 +94,19 @@ pub struct Connection {
     /// 接続を閉じる要求 (容量 1 の専用チャネル)
     close_request: mpsc::Sender<(u64, String)>,
     /// ピア起動の双方向ストリームの受け取り
-    accept_bidirectional: mpsc::Receiver<(SendStream, RecvStream)>,
+    ///
+    /// 複数のタスクが `&self` で同時に待てるようにするため Mutex で包む。これは
+    /// 共有状態の保護ではなく、`mpsc::Receiver::recv` が `&mut self` を要求する
+    /// ための内部同期である。待ち手は 1 つを想定しており、競合しても順に処理される。
+    accept_bidirectional: Mutex<mpsc::Receiver<(SendStream, RecvStream)>>,
     /// ピア起動の単方向ストリームの受け取り
-    accept_unidirectional: mpsc::Receiver<RecvStream>,
+    ///
+    /// `accept_bidirectional` と同じ理由で Mutex で包む。
+    accept_unidirectional: Mutex<mpsc::Receiver<RecvStream>>,
     /// 受信 DATAGRAM の受け取り
-    datagrams: mpsc::Receiver<Vec<u8>>,
+    ///
+    /// `accept_bidirectional` と同じ理由で Mutex で包む。
+    datagrams: Mutex<mpsc::Receiver<Vec<u8>>>,
     /// 接続が閉じた理由
     closed: watch::Receiver<Option<CloseReason>>,
 }
@@ -153,9 +161,9 @@ impl Connection {
         Self {
             commands,
             close_request,
-            accept_bidirectional: accept_bidirectional_rx,
-            accept_unidirectional: accept_unidirectional_rx,
-            datagrams: datagram_rx,
+            accept_bidirectional: Mutex::new(accept_bidirectional_rx),
+            accept_unidirectional: Mutex::new(accept_unidirectional_rx),
+            datagrams: Mutex::new(datagram_rx),
             closed: closed_rx,
         }
     }
@@ -182,16 +190,18 @@ impl Connection {
 
     /// ピア起動の双方向ストリームを受け取る
     ///
-    /// 接続が閉じた場合は `Ok(None)` を返す。
-    pub async fn accept_bidirectional(&mut self) -> Result<Option<(SendStream, RecvStream)>> {
-        Ok(self.accept_bidirectional.recv().await)
+    /// 接続が閉じた場合は `Ok(None)` を返す。`&self` で待てるため、[`Arc`] で
+    /// 共有した接続や、他の accept 系と同時に `select!` して待つことができる。
+    pub async fn accept_bidirectional(&self) -> Result<Option<(SendStream, RecvStream)>> {
+        Ok(self.accept_bidirectional.lock().await.recv().await)
     }
 
     /// ピア起動の単方向ストリームを受け取る
     ///
-    /// 接続が閉じた場合は `Ok(None)` を返す。
-    pub async fn accept_unidirectional(&mut self) -> Result<Option<RecvStream>> {
-        Ok(self.accept_unidirectional.recv().await)
+    /// 接続が閉じた場合は `Ok(None)` を返す。[`Self::accept_bidirectional`] と同様に
+    /// `&self` で待てる。
+    pub async fn accept_unidirectional(&self) -> Result<Option<RecvStream>> {
+        Ok(self.accept_unidirectional.lock().await.recv().await)
     }
 
     /// DATAGRAM を送信する
@@ -204,9 +214,10 @@ impl Connection {
 
     /// DATAGRAM を受信する
     ///
-    /// 接続が閉じた場合は `Ok(None)` を返す。
-    pub async fn recv_datagram(&mut self) -> Result<Option<Vec<u8>>> {
-        Ok(self.datagrams.recv().await)
+    /// 接続が閉じた場合は `Ok(None)` を返す。[`Self::accept_bidirectional`] と
+    /// 同様に `&self` で待てる。
+    pub async fn recv_datagram(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.datagrams.lock().await.recv().await)
     }
 
     /// QX_PING を送信し、シーケンス番号を返す
