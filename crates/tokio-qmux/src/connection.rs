@@ -4,6 +4,7 @@
 //! 行い、アプリケーションはストリームと DATAGRAM のハンドル越しに操作する。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -86,6 +87,13 @@ const STOP_SENDING_CAPACITY: usize = 16;
 const STREAM_EVENT_CAPACITY: usize = 16;
 /// 下位トランスポートから一度に読み取るバイト数の上限
 const READ_BUFFER_SIZE: usize = 64 * 1024;
+/// 自側の close の後でピアの shutdown を待つ上限の既定値 (3 秒)
+///
+/// ピアが送信側を shutdown しない限りドライバが終了しない状態を避けるため、待ち時間
+/// には必ず上限を設ける。QUIC version 1 の closing 状態が PTO の 3 倍を目安に終了する
+/// のと同じオーダーであり (RFC 9000 Section 10.2.1)、TCP 上の FIN の往復には十分な
+/// 長さである。[`Connection::with_linger`] で変更できる。
+pub const DEFAULT_LINGER: Duration = Duration::from_secs(3);
 
 /// QMux 接続
 ///
@@ -135,6 +143,9 @@ impl Connection {
     /// テスト用の duplex など) を渡す。TLS と ALPN のネゴシエーションは呼び出し側の
     /// 責務である。tokio ランタイムのコンテキストで呼び出すこと。
     ///
+    /// ピアの shutdown を待つ上限は [`DEFAULT_LINGER`] を使う。変更する場合は
+    /// [`Self::with_linger`] を使う。
+    ///
     /// # エラー
     ///
     /// `config` が送信できない設定 (`max_record_size` が既定値未満など) の場合は
@@ -142,6 +153,29 @@ impl Connection {
     /// DATAGRAM も無効なため、ストリームや DATAGRAM を使う場合は明示的に設定する
     /// こと。
     pub fn new<T>(role: Role, io: T, config: Config) -> Result<Self>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::with_linger(role, io, config, DEFAULT_LINGER)
+    }
+
+    /// ピアの shutdown を待つ上限を指定して QMux 接続を確立する
+    ///
+    /// [`Self::close`] を呼んだ後、ドライバは CONNECTION_CLOSE を送って下位
+    /// トランスポートの送信側を graceful に shutdown し、ピアが送信側を shutdown
+    /// するのを待つ (draft-ietf-quic-qmux-02 Section 7.2)。`linger` はこの待ち時間の
+    /// 上限で、`close` を要求した時点から数える。
+    ///
+    /// 上限を過ぎるとドライバは下位トランスポートを閉じて終了し、[`Self::closed`] は
+    /// [`CloseReason::Local`] を返す。ピアが shutdown しない場合だけでなく、ピアが
+    /// 読み取りを止めて送信が詰まった場合にも、ドライバが残り続けないようにするためで
+    /// ある。`Duration::ZERO` を指定すると、送信側の shutdown を試みた後でピアの
+    /// shutdown を待たない。
+    ///
+    /// # エラー
+    ///
+    /// [`Self::new`] と同じ。
+    pub fn with_linger<T>(role: Role, io: T, config: Config, linger: Duration) -> Result<Self>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -181,6 +215,10 @@ impl Connection {
             pending_stop_sending: VecDeque::new(),
             datagram_drops: 0,
             established: false,
+            linger,
+            linger_started: None,
+            write_shutdown: false,
+            linger_expired: false,
             read_scratch: vec![0u8; READ_BUFFER_SIZE],
             started: std::time::Instant::now(),
             close_reason: None,
@@ -341,6 +379,13 @@ impl Connection {
     /// CONNECTION_CLOSE フレームが送信される。容量 1 の専用チャネルへ送るため、
     /// コマンドチャネルの輻輳で要求が失われることはない。すでに未処理の close 要求が
     /// ある場合の送信失敗は、先行する要求が処理されるため無視してよい。
+    ///
+    /// ドライバは CONNECTION_CLOSE を送った後、下位トランスポートの送信側を
+    /// graceful に shutdown し、ピアが送信側を shutdown するのを待つ
+    /// (draft-ietf-quic-qmux-02 Section 7.2)。待ち時間の上限は [`Self::new`] では
+    /// [`DEFAULT_LINGER`]、[`Self::with_linger`] では指定した値である。上限を過ぎると
+    /// ドライバは下位トランスポートを閉じて終了し、[`Self::closed`] が
+    /// [`CloseReason::Local`] を返す。
     pub fn close(&self, error_code: u64, reason: &str) {
         let _ = self
             .close_request
@@ -418,6 +463,17 @@ struct Driver {
     datagram_drops: u64,
     /// ピアのトランスポートパラメータを受信済みかどうか
     established: bool,
+    /// 自側の close の後でピアの shutdown を待つ上限
+    linger: Duration,
+    /// 自側の close を要求した時刻 (要求していない場合は `None`)
+    ///
+    /// 期限を `Instant` の加算で持たないのは、桁あふれで panic するためである。
+    /// 残り時間は `linger` から経過時間を引いて求める。
+    linger_started: Option<Instant>,
+    /// 下位トランスポートの送信側を shutdown 済みかどうか
+    write_shutdown: bool,
+    /// linger の上限を過ぎたかどうか
+    linger_expired: bool,
     /// ストリーム読み取り用の作業バッファ
     read_scratch: Vec<u8>,
     /// ドライバ開始時刻
@@ -434,6 +490,28 @@ enum Wake {
     Command(Option<Command>),
     Close(Option<(u64, String)>),
     Timeout,
+}
+
+/// 送信フレームの書き出し結果
+enum FlushResult {
+    /// 送信待ちのフレームをすべて書き出した
+    Drained,
+    /// 下位トランスポートが使えなくなった
+    TransportFailed,
+    /// linger の上限を過ぎたため打ち切った
+    LingerExpired,
+}
+
+/// 下位トランスポートへの書き込みを待つ間に起きること
+enum WriteWake {
+    /// 書き込みを受け付けた (受け付けたバイト数)
+    Written(usize),
+    /// 下位トランスポートが使えなくなった
+    TransportFailed,
+    /// close 要求が届いた
+    CloseRequest(Option<(u64, String)>),
+    /// linger の上限を過ぎた
+    LingerExpired,
 }
 
 /// フロー制御で保留しているストリームデータ
@@ -461,21 +539,51 @@ impl Driver {
                 self.retry_readable();
                 self.retry_writes();
             }
-            if self.flush(&mut output).await.is_err() {
-                self.connection.transport_closed();
-                self.transport_ended = true;
-                self.process_events();
-                self.update_datagram_drops();
-                self.retry_stop_sending();
+            // 自側から閉じた場合は、そこから linger の上限を数える
+            if matches!(self.close_reason, Some(CloseReason::Local { .. })) {
+                self.start_linger();
             }
-            // 自分から閉じた場合は、CONNECTION_CLOSE を送った後にピアの
-            // shutdown を待ってから終了する (draft-ietf-quic-qmux-02 Section 7.2)。
+            match self.flush(&mut output).await {
+                FlushResult::Drained => {}
+                FlushResult::TransportFailed => {
+                    self.connection.transport_closed();
+                    self.transport_ended = true;
+                    self.process_events();
+                    self.update_datagram_drops();
+                    self.retry_stop_sending();
+                }
+                FlushResult::LingerExpired => {
+                    // ピアが読み取らないまま上限を過ぎた。以降の送信は行わない。
+                    // flush の中で close 要求を受けた場合、その理由はまだ
+                    // close_reason に反映されていないため、ここでイベントを取り出す。
+                    self.linger_expired = true;
+                    self.process_events();
+                }
+            }
+            // Section 7.2: 自側から閉じた場合は、CONNECTION_CLOSE を送った後に下位
+            // トランスポートの送信側を graceful に shutdown する。ピアが読み取って
+            // いなければ shutdown も完了しないため、shutdown の待ちも上限で打ち切る。
+            if matches!(self.close_reason, Some(CloseReason::Local { .. })) && !self.write_shutdown
+            {
+                self.write_shutdown = true;
+                if !self.shutdown_write_side().await {
+                    // shutdown できない下位トランスポートは使えないものとして扱う
+                    self.transport_ended = true;
+                }
+            }
+            // 自分から閉じた場合は、CONNECTION_CLOSE を送った後にピアの shutdown を
+            // 待ってから終了する (draft-ietf-quic-qmux-02 Section 7.2)。ただし linger の
+            // 上限を過ぎたら終了する。ピアが shutdown しない場合や、ピアが読み取りを
+            // 止めて送信が詰まった場合でも、ドライバが残り続けないようにするためである。
             // ピアの切断や下位トランスポートの閉塞を観測した場合は即座に終了する。
-            let should_break = match &self.close_reason {
-                Some(CloseReason::Local { .. }) => self.transport_ended,
-                Some(_) => true,
-                None => false,
-            };
+            let should_break = self.linger_expired
+                || match &self.close_reason {
+                    Some(CloseReason::Local { .. }) => {
+                        self.transport_ended || self.linger_remaining().is_some_and(|r| r.is_zero())
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
             if should_break {
                 break;
             }
@@ -541,16 +649,56 @@ impl Driver {
     }
 
     /// 次のタイマーまでのスリープ時間を返す
-    fn next_sleep_duration(&self) -> Option<std::time::Duration> {
-        self.connection.next_timeout().map(|deadline| {
+    ///
+    /// アイドルタイムアウトと linger の上限のうち、早い方までの時間を返す。
+    fn next_sleep_duration(&self) -> Option<Duration> {
+        let idle = self.connection.next_timeout().map(|deadline| {
             let now = self.now().as_micros();
             let then = deadline.as_micros();
             if then <= now {
-                std::time::Duration::ZERO
+                Duration::ZERO
             } else {
-                std::time::Duration::from_micros(then - now)
+                Duration::from_micros(then - now)
             }
-        })
+        });
+        match (idle, self.linger_remaining()) {
+            (Some(idle), Some(linger)) => Some(idle.min(linger)),
+            (Some(idle), None) => Some(idle),
+            (None, Some(linger)) => Some(linger),
+            (None, None) => None,
+        }
+    }
+
+    /// 自側の close の後でピアの shutdown を待つ上限を数え始める
+    ///
+    /// 送信が詰まっている間も close 要求を見ているため、メインループと [`Self::flush`]
+    /// の両方から呼ばれる。上限は close を要求した時点から数える。
+    fn start_linger(&mut self) {
+        if self.linger_started.is_none() {
+            self.linger_started = Some(Instant::now());
+        }
+    }
+
+    /// linger の残り時間を返す
+    ///
+    /// 自側の close を要求していない場合は `None` を返す。
+    fn linger_remaining(&self) -> Option<Duration> {
+        self.linger_started
+            .map(|started| self.linger.saturating_sub(started.elapsed()))
+    }
+
+    /// 下位トランスポートの送信側を graceful に shutdown する (Section 7.2)
+    ///
+    /// ピアが読み取っていない場合は shutdown も完了しないため、linger の残り時間で
+    /// 打ち切る。戻り値は shutdown が完了したかどうか。
+    async fn shutdown_write_side(&mut self) -> bool {
+        let remaining = self.linger_remaining().unwrap_or(Duration::ZERO);
+        let writer = &mut self.writer;
+        tokio::select! {
+            biased;
+            result = writer.shutdown() => result.is_ok(),
+            _ = tokio::time::sleep(remaining) => false,
+        }
     }
 
     /// 破棄した DATAGRAM の累計個数をアプリケーションへ通知する
@@ -792,17 +940,62 @@ impl Driver {
     }
 
     /// 保留している送信フレームを書き出す
-    async fn flush(&mut self, output: &mut Vec<u8>) -> Result<()> {
+    ///
+    /// ピアが読み取りを止めると書き込みが完了しなくなるため、`write_all` ではなく
+    /// オフセット付きの `AsyncWrite::write` を使い、`select!` で close 要求と linger の
+    /// 上限を同時に待つ。`write` は完了する前に破棄されてもバイト列を書かないため、
+    /// Record の書きかけの位置を失わない。`write_all` は途中まで書いた位置を内部に
+    /// 隠すため、この用途には使えない。
+    ///
+    /// 上限を過ぎた場合は書きかけの Record を諦めて終了する。ピアが読み取っていない
+    /// 以上その Record は届かないため、途中で切れていても構わない。
+    async fn flush(&mut self, output: &mut Vec<u8>) -> FlushResult {
         loop {
             output.clear();
-            let more = self
-                .connection
-                .poll_transmit(output, self.now())
-                .map_err(Error::Qmux)?;
+            let more = match self.connection.poll_transmit(output, self.now()) {
+                Ok(more) => more,
+                Err(_) => return FlushResult::TransportFailed,
+            };
             if !more {
-                return Ok(());
+                return FlushResult::Drained;
             }
-            self.writer.write_all(output).await.map_err(Error::Io)?;
+            // 1 つの Record は最後まで書く。途中で切るとピアが Record を復元できない
+            // ため、ここで書き切ってから次の Record へ進む。
+            let mut written = 0;
+            while written < output.len() {
+                let remaining = self.linger_remaining();
+                let wake = {
+                    let writer = &mut self.writer;
+                    let close_request_rx = &mut self.close_request_rx;
+                    tokio::select! {
+                        biased;
+                        result = writer.write(&output[written..]) => match result {
+                            Ok(len) => WriteWake::Written(len),
+                            Err(_) => WriteWake::TransportFailed,
+                        },
+                        request = close_request_rx.recv() => WriteWake::CloseRequest(request),
+                        _ = sleep_for(remaining) => WriteWake::LingerExpired,
+                    }
+                };
+                match wake {
+                    // 0 バイトの書き込みは下位トランスポートが閉じたことを表す
+                    WriteWake::Written(0) => return FlushResult::TransportFailed,
+                    WriteWake::Written(len) => written += len,
+                    WriteWake::TransportFailed => return FlushResult::TransportFailed,
+                    WriteWake::CloseRequest(Some((error_code, reason))) => {
+                        // 送信中の Record は書き切ってから CONNECTION_CLOSE を送る。
+                        // 送信待ちのフレームは `close` が破棄するため、ここから linger の
+                        // 上限を数えれば、ピアが読み取らないままでも期限で終了できる。
+                        self.connection.close(error_code, &reason);
+                        self.start_linger();
+                    }
+                    WriteWake::CloseRequest(None) => {
+                        // Connection がドロップされ、閉じる要求も届かなくなった
+                        return FlushResult::TransportFailed;
+                    }
+                    WriteWake::LingerExpired => return FlushResult::LingerExpired,
+                }
+            }
         }
     }
 
@@ -876,6 +1069,8 @@ impl Driver {
     }
 
     /// ドライバを終了し、アプリケーションへ切断を通知する
+    ///
+    /// `self` を消費するため、この関数を抜けると下位トランスポートも閉じられる。
     fn finish(mut self) {
         let reason = self
             .close_reason
@@ -886,5 +1081,17 @@ impl Driver {
         self.send_streams.clear();
         self.pending_writes.clear();
         self.pending_stop_sending.clear();
+    }
+}
+
+/// 指定した残り時間だけ待つ
+///
+/// 残り時間が無い場合 (自側の close を要求していない場合) は、期限が無いものとして
+/// 永久に待つ。`Instant` ではなく残り時間で待つのは、期限の計算で桁あふれを
+/// 起こさないためである。
+async fn sleep_for(remaining: Option<Duration>) {
+    match remaining {
+        Some(remaining) => tokio::time::sleep(remaining).await,
+        None => core::future::pending::<()>().await,
     }
 }

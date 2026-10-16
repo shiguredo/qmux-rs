@@ -16,6 +16,19 @@
 //! TLS と ALPN のネゴシエーションは呼び出し側の責務である。[`Connection::new`] には
 //! 接続済みの双方向バイトストリームを渡す。
 //!
+//! # 接続の終了
+//!
+//! [`Connection::close`] を呼ぶと CONNECTION_CLOSE が送られ、ドライバは下位
+//! トランスポートの送信側を graceful に shutdown した後、ピアが送信側を shutdown
+//! するのを待つ (draft-ietf-quic-qmux-02 Section 7.2)。ピアが shutdown しない場合や、
+//! ピアが読み取りを止めて送信が詰まった場合にドライバが残り続けないよう、待ち時間には
+//! 上限を設ける。既定値は [`DEFAULT_LINGER`] (3 秒) で、[`Connection::with_linger`] で
+//! 変更できる。上限を過ぎるとドライバは下位トランスポートを閉じて終了し、
+//! [`Connection::closed`] が [`shiguredo_qmux::event::CloseReason::Local`] を返す。
+//!
+//! ピアが送ってきた CONNECTION_CLOSE (Section 7.3)、下位トランスポートの閉塞
+//! (Section 7.4)、アイドルタイムアウト (Section 7.1) では、ドライバは即座に終了する。
+//!
 //! # QUIC の上で動かす場合との違い
 //!
 //! QMux は QUIC と API が似ているが、下位が順序保証された単一のバイトストリーム
@@ -64,6 +77,6 @@ mod connection;
 mod error;
 mod stream;
 
-pub use connection::Connection;
+pub use connection::{Connection, DEFAULT_LINGER};
 pub use error::{Error, Result};
 pub use stream::{RecvStream, SendStream, StopSendingObserved};

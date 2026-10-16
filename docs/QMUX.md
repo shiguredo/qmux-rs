@@ -47,6 +47,27 @@ QMux 自体は暗号化も認証も行いません。接続の確立、秘匿、
 `Connection::is_closed` が `true` になったら、`poll_transmit` で残りを書き出した後に下位
 トランスポートの送信側を閉じます (draft-ietf-quic-qmux-02 Section 7.2)。
 
+## tokio ラッパーの切断
+
+`crates/tokio-qmux` のドライバは、`tokio_qmux::Connection::close` の要求を受けると
+CONNECTION_CLOSE を送り、下位トランスポートの送信側を graceful に shutdown し、
+ピアが送信側を shutdown するのを待ちます (draft-ietf-quic-qmux-02 Section 7.2)。
+
+この待ち時間には上限 (linger) があり、既定値は `tokio_qmux::DEFAULT_LINGER` (3 秒)
+です。`tokio_qmux::Connection::with_linger` で変更できます。
+
+ピアが shutdown しない場合も、ピアが読み取りを止めて送信が詰まった場合も、期限を
+過ぎるとドライバは下位トランスポートを閉じて終了します。このとき
+`tokio_qmux::Connection::closed` は `shiguredo_qmux::event::CloseReason::Local` を
+返します。
+
+ピア起因の切断 (Section 7.3)、下位トランスポートの閉塞 (Section 7.4)、アイドル
+タイムアウト (Section 7.1) では、ドライバは linger を待たずに即座に終了します。
+
+`tokio_qmux::Connection` をドロップした場合も、ドライバは linger の期限を待たずに
+下位トランスポートを閉じて終了します。この上限は close の後にピアの shutdown を
+待つ間の打ち切りであり、ドロップによる終了を遅らせるものではありません。
+
 ## 仕様との対応
 
 | 仕様の節 | 実装 |
@@ -60,7 +81,7 @@ QMux 自体は暗号化も認証も行いません。接続の確立、秘匿、
 | Section 5.2 max_record_size | `record.rs` / `transport_params.rs`。既定値 16382、既定値未満は TRANSPORT_PARAMETER_ERROR |
 | Section 6 Forward Progress | `receive` はアプリケーションの読み取りと独立に Record を処理する |
 | Section 7.1 アイドルタイムアウト | `connection.rs`。Record の送受信でリセットし、実効値は両端の 0 でない値の最小値 |
-| Section 7.2 / 7.3 切断 | `connection.rs`。CONNECTION_CLOSE の送受信と、切断後の受信データの破棄 |
+| Section 7.2 / 7.3 切断 | `connection.rs` と `crates/tokio-qmux`。CONNECTION_CLOSE の送受信と、切断後の受信データの破棄。tokio 側はピアの shutdown を待つ上限 (linger) を設け、期限でドライバを終了する |
 | Section 9.1 DATAGRAM 拡張 | `connection.rs`。送信は `max_datagram_frame_size` と `max_record_size` の両方で上限を検査し、受信は広告した上限の超過と非サポート時の受信を PROTOCOL_VIOLATION とする |
 | Section 12.2 サービス妨害 | 受信した DATAGRAM は未配送の保持量に上限を設け、超過分を破棄する (Section 6 が明示的に許す) |
 

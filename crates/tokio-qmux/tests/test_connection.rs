@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::Duration;
+use shiguredo_qmux::codec::time::Timestamp;
 use shiguredo_qmux::config::Config;
 use shiguredo_qmux::event::CloseReason;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_qmux::{Connection, Error, RecvStream};
 
 /// テスト用の設定
@@ -418,6 +420,347 @@ async fn local_close_is_reported_to_peer() {
         } => {
             assert!(application, "アプリケーションエラーであること");
             assert_eq!(error_code, 0x1234, "エラーコードが一致すること");
+        }
+        other => panic!("ピアの切断を期待したが {other:?} だった"),
+    }
+}
+
+/// 読み取って捨てるだけの生ピアのタスクを立てる
+///
+/// QMux を実装しないピアを想定し、届いたバイト列を読み捨てるだけで shutdown しない。
+/// 送信側の shutdown による EOF を観測したら、その時刻と、ピアの送信側を閉じない
+/// よう保持した io を返す。時刻は shutdown がドライバの終了より前に起きることの
+/// 検証に使う (duplex ではドライバ終了時の drop でも EOF になるため)。
+fn spawn_discarding_peer(
+    mut peer_io: tokio::io::DuplexStream,
+) -> tokio::task::JoinHandle<(std::time::Instant, tokio::io::DuplexStream)> {
+    tokio::spawn(async move {
+        let mut scratch = [0u8; 1024];
+        loop {
+            // QMux を実装しないピアは届いたバイト列を解釈せずに捨てる
+            let len = peer_io
+                .read(&mut scratch)
+                .await
+                .expect("生ピアの読み取りが失敗した");
+            if len == 0 {
+                // 下位トランスポートの送信側が shutdown された (EOF)
+                break;
+            }
+        }
+        (std::time::Instant::now(), peer_io)
+    })
+}
+
+#[tokio::test]
+async fn close_ends_driver_when_peer_never_shuts_down() {
+    // Section 7.2: 自側から close した場合、ドライバは CONNECTION_CLOSE を送った後で
+    // ピアの shutdown を待つ。ピアが shutdown しない限りドライバが終了しない実装では
+    // 接続とタスクが残り続けるため、待ち時間には上限 (linger) が必要である。
+    //
+    // QMux を実装しない生ピアを用意し、ピアが shutdown しない場合でも linger の期限で
+    // ドライバが終了し、closed() が自側の close の理由で解決することを検証する
+    // (回帰テストの本体)。
+    let (peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::with_linger(
+        Role::Client,
+        client_io,
+        config(),
+        std::time::Duration::from_millis(200),
+    )
+    .expect("テスト用のクライアント接続を作成できる");
+    // 生ピアは読み取って捨てるだけにし、shutdown しない
+    let peer = spawn_discarding_peer(peer_io);
+
+    client.close(0x1234, "bye");
+
+    // 5 秒の guard を置き、実装が壊れている場合にテストがハングしないようにする。
+    // ピアが shutdown しないため、linger の上限がなければここは解決しない。
+    let close_reason = tokio::time::timeout(std::time::Duration::from_secs(5), client.closed())
+        .await
+        .expect("linger の期限までにドライバが終了すること");
+    match close_reason {
+        CloseReason::Local {
+            application,
+            error_code,
+            reason,
+        } => {
+            assert!(application, "アプリケーションエラーであること");
+            assert_eq!(error_code, 0x1234, "close に渡したエラーコードが返ること");
+            assert_eq!(reason, "bye", "close に渡した理由が返ること");
+        }
+        other => panic!("自側の close を期待したが {other:?} だった"),
+    }
+
+    // ドライバの終了時に下位トランスポートの送信側が閉じられ、ピアが EOF を観測して
+    // 終了すること。ピアの io はテストの最後まで保持し、ピアの送信側を閉じない
+    // (ピアの EOF と linger の期限を混同しないため)。
+    let (_eof_at, _peer_io) = tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+        .await
+        .expect("ピアが EOF を観測して終了すること")
+        .expect("ピアのタスクが終了すること");
+}
+
+#[tokio::test]
+async fn close_ends_driver_without_waiting_when_linger_is_zero() {
+    // linger = ZERO は「送信側の shutdown を試みた後、ピアの shutdown を待たない」
+    // ことを意味する。ピアが shutdown しない場合でも closed() が解決することを検証する。
+    let (peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client =
+        Connection::with_linger(Role::Client, client_io, config(), std::time::Duration::ZERO)
+            .expect("テスト用のクライアント接続を作成できる");
+    let peer = spawn_discarding_peer(peer_io);
+
+    client.close(0x1234, "bye");
+
+    // 5 秒の guard を置き、実装が壊れている場合にテストがハングしないようにする
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(5), client.closed())
+        .await
+        .expect("linger が ZERO の場合は期限を待たずにドライバが終了すること");
+    match reason {
+        CloseReason::Local { error_code, .. } => {
+            assert_eq!(error_code, 0x1234, "close に渡したエラーコードが返ること");
+        }
+        other => panic!("自側の close を期待したが {other:?} だった"),
+    }
+
+    // ドライバの終了時に下位トランスポートの送信側が閉じられ、ピアが EOF を観測して
+    // 終了すること
+    let (_eof_at, _peer_io) = tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+        .await
+        .expect("ピアが EOF を観測して終了すること")
+        .expect("ピアのタスクが終了すること");
+}
+
+#[tokio::test]
+async fn peer_shutdown_ends_driver_before_linger_expires() {
+    // Section 7.2: ピアが送信側を shutdown すれば、ドライバは linger の期限を待たずに
+    // 終了する。linger を 30 秒にして、ピアの shutdown が期限より先にドライバを
+    // 終了させることを検証する。
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // pair() は既定 linger の Connection::new を使うため、client だけ with_linger で
+    // 作り直す (server は pair() と同じ構成)
+    let client = Connection::with_linger(
+        Role::Client,
+        client_io,
+        config(),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("テスト用のクライアント接続を作成できる");
+    let server = Connection::new(Role::Server, server_io, config())
+        .expect("テスト用のサーバー接続を作成できる");
+
+    client.close(0x1234, "bye");
+
+    // 30 秒の期限を待たず、ピアの shutdown で 2 秒以内にドライバが終了すること
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(2), client.closed())
+        .await
+        .expect("ピアの shutdown により linger の期限を待たずにドライバが終了すること");
+    match reason {
+        CloseReason::Local { error_code, .. } => {
+            assert_eq!(error_code, 0x1234, "close に渡したエラーコードが返ること");
+        }
+        other => panic!("自側の close を期待したが {other:?} だった"),
+    }
+
+    // close がピアへ届き、ピア側はピア起因の切断として観測すること
+    let server_reason = tokio::time::timeout(std::time::Duration::from_secs(5), server.closed())
+        .await
+        .expect("ピアが close を観測して終了すること");
+    match server_reason {
+        CloseReason::Peer { error_code, .. } => {
+            assert_eq!(
+                error_code, 0x1234,
+                "ピアが受け取ったエラーコードが一致すること"
+            );
+        }
+        other => panic!("ピアの切断を期待したが {other:?} だった"),
+    }
+}
+
+#[tokio::test]
+async fn close_ends_driver_while_write_is_blocked() {
+    // Section 7.2: ピアが読み取りを止めて送信が詰まっている場合でも、close 要求は
+    // write の詰まりに埋もれず、linger の期限でドライバが終了することを検証する。
+    //
+    // QMux を実装しない生ピアを Sans I/O の Connection (Role::Server) でハンドシェイク
+    // だけ済ませ、その後は読み取らないようにする。クライアントが 64 KiB を書くと
+    // 小さな duplex のバッファが埋まり、ドライバの write が詰まる。
+    let (mut peer_io, client_io) = tokio::io::duplex(1024);
+    let client = Connection::with_linger(
+        Role::Client,
+        client_io,
+        config(),
+        std::time::Duration::from_millis(200),
+    )
+    .expect("テスト用のクライアント接続を作成できる");
+
+    // 生ピアのハンドシェイク。クライアントの QX_TRANSPORT_PARAMETERS を処理し、
+    // 自分のトランスポートパラメータを返すところまで進める
+    let peer = tokio::spawn(async move {
+        let mut peer = shiguredo_qmux::connection::Connection::new(Role::Server, config())
+            .expect("テスト用のピア接続を作成できる");
+        let now = Timestamp::from_micros(0);
+        let mut scratch = [0u8; 1024];
+        let mut output = Vec::new();
+        while peer.peer_transport_parameters().is_none() {
+            let len = peer_io
+                .read(&mut scratch)
+                .await
+                .expect("生ピアがクライアントの送信を読み取れる");
+            assert!(len > 0, "生ピアが EOF を観測しないこと");
+            peer.receive(&scratch[..len], now);
+            // poll_transmit は Vec に追記するため、呼ぶ前に clear する
+            loop {
+                output.clear();
+                if !peer
+                    .poll_transmit(&mut output, now)
+                    .expect("送信する Record を取り出せる")
+                {
+                    break;
+                }
+                peer_io
+                    .write_all(&output)
+                    .await
+                    .expect("生ピアがクライアントへ書き込める");
+            }
+        }
+        // ここから先は読み取らない。詰まった write を作るため、io はテスト側へ渡して
+        // 保持する
+        peer_io
+    });
+
+    // ハンドシェイクが済むまで待つ (ピアはこの後読み取らない)
+    let _peer_io = tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+        .await
+        .expect("ピアがハンドシェイクを終えること")
+        .expect("ピアのタスクが終了すること");
+
+    // クライアントは 64 KiB のストリームデータを書き、ピアが読み取らないためドライバの
+    // write が詰まる。write の完了は待たず、結果も使わない
+    let client = Arc::new(client);
+    let writer_client = Arc::clone(&client);
+    let writer = tokio::spawn(async move {
+        let (mut send, _recv) = writer_client
+            .open_bidirectional()
+            .await
+            .expect("双方向ストリームを開ける");
+        let payload = vec![0u8; 64 * 1024];
+        send.write(&payload).await
+    });
+
+    // ドライバの write が詰まるのを待つ。ピアが読み取らないため write は完了しない
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !writer.is_finished(),
+        "ピアが読み取らないため 64 KiB の write は完了しないこと"
+    );
+
+    // write が詰まっていても close 要求が処理されること
+    client.close(0x1234, "bye");
+
+    // 5 秒の guard を置き、実装が壊れている場合にテストがハングしないようにする
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(5), client.closed())
+        .await
+        .expect("write が詰まっていても linger の期限までにドライバが終了すること");
+    match reason {
+        CloseReason::Local { error_code, .. } => {
+            assert_eq!(error_code, 0x1234, "close に渡したエラーコードが返ること");
+        }
+        other => panic!("自側の close を期待したが {other:?} だった"),
+    }
+
+    // 詰まった write のタスクは結果を使わないため終了させる
+    writer.abort();
+    let _ = writer.await;
+}
+
+#[tokio::test]
+async fn write_side_is_shut_down_before_linger_expires() {
+    // Section 7.2: 自側の close の後、ドライバは CONNECTION_CLOSE を送ってから下位
+    // トランスポートの送信側を graceful に shutdown する。ドライバの終了時に io を
+    // drop するだけでもピアは EOF を観測するため、EOF の有無だけでは shutdown を
+    // 検証できない。ここでは「ピアの EOF がドライバの終了より 1 秒以上早いこと」で
+    // shutdown を判別する。linger を 2 秒にしているため、shutdown が実装されていれば
+    // EOF は close の直後に届き、ドライバは期限の約 2 秒後に終了する。
+    let (peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::with_linger(
+        Role::Client,
+        client_io,
+        config(),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("テスト用のクライアント接続を作成できる");
+    // 生ピアは読み取って捨てるだけにし、shutdown しない
+    let peer = spawn_discarding_peer(peer_io);
+
+    // close() を呼ぶ直前を起点に、EOF の観測時刻と closed() の解決時刻を測る
+    let close_started = std::time::Instant::now();
+    client.close(0x1234, "bye");
+
+    // 5 秒の guard を置き、実装が壊れている場合にテストがハングしないようにする
+    let close_reason = tokio::time::timeout(std::time::Duration::from_secs(5), client.closed())
+        .await
+        .expect("linger の期限までにドライバが終了すること");
+    let driver_elapsed = close_started.elapsed();
+    match close_reason {
+        CloseReason::Local { error_code, .. } => {
+            assert_eq!(error_code, 0x1234, "close に渡したエラーコードが返ること");
+        }
+        other => panic!("自側の close を期待したが {other:?} だった"),
+    }
+
+    // ピアが EOF を観測した時刻。io はテストの最後まで保持し、ピアの送信側を閉じない
+    let (eof_at, _peer_io) = tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+        .await
+        .expect("ピアが EOF を観測して終了すること")
+        .expect("ピアのタスクが終了すること");
+    let eof_elapsed = eof_at.duration_since(close_started);
+
+    assert!(
+        eof_elapsed + std::time::Duration::from_secs(1) < driver_elapsed,
+        "送信側の shutdown がドライバの終了より前にピアへ届くこと: \
+         EOF {eof_elapsed:?} / ドライバ終了 {driver_elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn max_linger_does_not_panic_and_peer_shutdown_ends_driver() {
+    // linger に Duration::MAX を渡しても、期限の計算で桁あふれ (panic) しないことを
+    // 検証する。期限を Instant::now() + linger で計算する実装ではドライバが panic し、
+    // 理由を通知せずに終了するため closed() が CloseReason::TransportClosed になる。
+    // ピアが shutdown するため、期限を待たずに CloseReason::Local で解決すること。
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // pair() は既定 linger の Connection::new を使うため、client だけ with_linger で
+    // 作り直す (server は pair() と同じ構成)
+    let client =
+        Connection::with_linger(Role::Client, client_io, config(), std::time::Duration::MAX)
+            .expect("テスト用のクライアント接続を作成できる");
+    let server = Connection::new(Role::Server, server_io, config())
+        .expect("テスト用のサーバー接続を作成できる");
+
+    client.close(0x1234, "bye");
+
+    // 2 秒の guard を置き、ピアの shutdown で期限を待たずに終了することを確認する
+    let close_reason = tokio::time::timeout(std::time::Duration::from_secs(2), client.closed())
+        .await
+        .expect("ピアの shutdown により期限を待たずにドライバが終了すること");
+    match close_reason {
+        CloseReason::Local { error_code, .. } => {
+            assert_eq!(error_code, 0x1234, "close に渡したエラーコードが返ること");
+        }
+        other => panic!("自側の close を期待したが {other:?} だった"),
+    }
+
+    // close がピアへ届き、ピア側はピア起因の切断として観測すること
+    let server_reason = tokio::time::timeout(std::time::Duration::from_secs(5), server.closed())
+        .await
+        .expect("ピアが close を観測して終了すること");
+    match server_reason {
+        CloseReason::Peer { error_code, .. } => {
+            assert_eq!(
+                error_code, 0x1234,
+                "ピアが受け取ったエラーコードが一致すること"
+            );
         }
         other => panic!("ピアの切断を期待したが {other:?} だった"),
     }
