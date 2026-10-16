@@ -16,7 +16,7 @@ use shiguredo_qmux::event::{CloseReason, Event};
 use shiguredo_qmux::stream::{ReadResult, StreamId};
 
 use crate::error::{Error, Result};
-use crate::stream::{RecvStream, SendEvent, SendStream, StreamEvent};
+use crate::stream::{RecvStream, SendEvent, SendStream, StopSendingObserved, StreamEvent};
 
 /// アプリケーションからドライバへのコマンド
 #[derive(Debug)]
@@ -75,6 +75,10 @@ const CLOSE_CAPACITY: usize = 1;
 const ACCEPT_CAPACITY: usize = 16;
 /// 受信 DATAGRAM の保持数の上限
 const DATAGRAM_CAPACITY: usize = 64;
+/// 接続単位で観測する STOP_SENDING の保持数の上限
+///
+/// あふれた分はドライバが保留し、空きができ次第配送する。
+const STOP_SENDING_CAPACITY: usize = 16;
 /// ストリームごとのイベントチャネルの容量
 ///
 /// 受信側と送信側でそれぞれ 1 本のチャネルを使う。
@@ -107,6 +111,10 @@ pub struct Connection {
     ///
     /// `accept_bidirectional` と同じ理由で Mutex で包む。
     datagrams: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// ピアが要求した送信停止の受け取り
+    ///
+    /// `accept_bidirectional` と同じ理由で Mutex で包む。
+    stop_sending: Mutex<mpsc::Receiver<StopSendingObserved>>,
     /// 接続が閉じた理由
     closed: watch::Receiver<Option<CloseReason>>,
 }
@@ -131,6 +139,7 @@ impl Connection {
         let (accept_bidirectional_tx, accept_bidirectional_rx) = mpsc::channel(ACCEPT_CAPACITY);
         let (accept_unidirectional_tx, accept_unidirectional_rx) = mpsc::channel(ACCEPT_CAPACITY);
         let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_CAPACITY);
+        let (stop_sending_tx, stop_sending_rx) = mpsc::channel(STOP_SENDING_CAPACITY);
         let (closed_tx, closed_rx) = watch::channel(None);
 
         let (reader, writer) = tokio::io::split(io);
@@ -144,12 +153,14 @@ impl Connection {
             accept_bidirectional_tx,
             accept_unidirectional_tx,
             datagram_tx,
+            stop_sending_tx,
             closed_tx,
             recv_streams: BTreeMap::new(),
             send_streams: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
             pending_readable: BTreeSet::new(),
             pending_commands: VecDeque::new(),
+            pending_stop_sending: VecDeque::new(),
             established: false,
             read_scratch: vec![0u8; READ_BUFFER_SIZE],
             started: std::time::Instant::now(),
@@ -164,6 +175,7 @@ impl Connection {
             accept_bidirectional: Mutex::new(accept_bidirectional_rx),
             accept_unidirectional: Mutex::new(accept_unidirectional_rx),
             datagrams: Mutex::new(datagram_rx),
+            stop_sending: Mutex::new(stop_sending_rx),
             closed: closed_rx,
         }
     }
@@ -218,6 +230,19 @@ impl Connection {
     /// 同様に `&self` で待てる。
     pub async fn recv_datagram(&self) -> Result<Option<Vec<u8>>> {
         Ok(self.datagrams.lock().await.recv().await)
+    }
+
+    /// ピアが要求した送信停止を受け取る (STOP_SENDING)
+    ///
+    /// 対象のストリーム ID とピアが指定したアプリケーションエラーコードを返す
+    /// (RFC 9000 Section 19.5)。接続が閉じた場合は `Ok(None)` を返す。
+    /// [`Self::accept_bidirectional`] と同様に `&self` で待てるため、送信ストリーム
+    /// を所有するタスクとは別のタスクで待つことができる。
+    ///
+    /// [`SendStream::stopped`] が返すのと同じ通知を接続単位で受け取る入り口である。
+    /// ストリーム単位か接続単位かは、アプリケーションのタスク構成に応じて選ぶ。
+    pub async fn recv_stop_sending(&self) -> Result<Option<StopSendingObserved>> {
+        Ok(self.stop_sending.lock().await.recv().await)
     }
 
     /// QX_PING を送信し、シーケンス番号を返す
@@ -281,6 +306,8 @@ struct Driver {
     accept_unidirectional_tx: mpsc::Sender<RecvStream>,
     /// 受信 DATAGRAM の受け渡し
     datagram_tx: mpsc::Sender<Vec<u8>>,
+    /// 接続単位の STOP_SENDING 通知の受け渡し
+    stop_sending_tx: mpsc::Sender<StopSendingObserved>,
     /// 接続が閉じた理由の通知
     closed_tx: watch::Sender<Option<CloseReason>>,
     /// ストリーム ID から受信イベント送信への対応
@@ -295,6 +322,8 @@ struct Driver {
     pending_readable: BTreeSet<StreamId>,
     /// 接続の確立を待っているコマンド
     pending_commands: VecDeque<Command>,
+    /// 接続単位の通知チャネルが埋まっているため保留している STOP_SENDING
+    pending_stop_sending: VecDeque<StopSendingObserved>,
     /// ピアのトランスポートパラメータを受信済みかどうか
     established: bool,
     /// ストリーム読み取り用の作業バッファ
@@ -334,6 +363,7 @@ impl Driver {
 
         loop {
             self.process_events();
+            self.retry_stop_sending();
             if self.close_reason.is_none() {
                 self.retry_readable();
                 self.retry_writes();
@@ -342,6 +372,7 @@ impl Driver {
                 self.connection.transport_closed();
                 self.transport_ended = true;
                 self.process_events();
+                self.retry_stop_sending();
             }
             // 自分から閉じた場合は、CONNECTION_CLOSE を送った後にピアの
             // shutdown を待ってから終了する (draft-ietf-quic-qmux-02 Section 7.2)。
@@ -503,7 +534,7 @@ impl Driver {
         RecvStream::new(id, rx, self.command_tx.clone())
     }
 
-    /// ピアの STOP_SENDING を送信側ハンドルへ通知する
+    /// ピアの STOP_SENDING を送信側ハンドルと接続単位の通知先へ配送する
     ///
     /// 送信側はピアが送信停止を要求した時点で終端する (RFC 9000 Section 3.5)。
     /// 送信待ちのデータを破棄し、送信側ハンドルへエラーコードを配送する。
@@ -514,6 +545,31 @@ impl Driver {
         if let Some(queue) = self.pending_writes.remove(&id) {
             for pending in queue {
                 let _ = pending.ack.send(Err(Error::Stopped(error_code)));
+            }
+        }
+        // 接続単位で待つ利用側にも通知する。チャネルが埋まっていても失わないよう、
+        // ここでは保留キューに入れるだけにして実際の配送は retry_stop_sending が行う。
+        self.pending_stop_sending
+            .push_back(StopSendingObserved { id, error_code });
+    }
+
+    /// 接続単位の STOP_SENDING 通知チャネルへ保留分を配送する
+    ///
+    /// STOP_SENDING はストリームごとに一度だけ発生する制御信号であり、DATAGRAM と
+    /// 違って破棄してはならないため、チャネルが埋まっている間はドライバが保留する。
+    fn retry_stop_sending(&mut self) {
+        while let Some(event) = self.pending_stop_sending.pop_front() {
+            match self.stop_sending_tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.pending_stop_sending.push_front(event);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Connection がドロップされ、通知先がなくなった
+                    self.pending_stop_sending.clear();
+                    break;
+                }
             }
         }
     }
@@ -714,5 +770,6 @@ impl Driver {
         self.recv_streams.clear();
         self.send_streams.clear();
         self.pending_writes.clear();
+        self.pending_stop_sending.clear();
     }
 }

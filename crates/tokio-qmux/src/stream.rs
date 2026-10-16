@@ -23,6 +23,18 @@ pub(crate) enum SendEvent {
     StopSending(u64),
 }
 
+/// ピアが要求した送信停止の通知 (STOP_SENDING)
+///
+/// [`crate::Connection::recv_stop_sending`] が返す。対象のストリーム ID と、ピアが
+/// 指定したアプリケーションエラーコードを保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopSendingObserved {
+    /// 送信停止を要求されたストリームの ID
+    pub id: StreamId,
+    /// ピアが指定したアプリケーションエラーコード
+    pub error_code: u64,
+}
+
 /// ストリームの送信側
 #[derive(Debug)]
 pub struct SendStream {

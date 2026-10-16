@@ -47,4 +47,4 @@ mod stream;
 
 pub use connection::Connection;
 pub use error::{Error, Result};
-pub use stream::{RecvStream, SendStream};
+pub use stream::{RecvStream, SendStream, StopSendingObserved};

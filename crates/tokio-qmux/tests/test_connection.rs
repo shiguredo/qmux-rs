@@ -206,6 +206,48 @@ async fn write_after_stop_sending_fails_with_stopped() {
 }
 
 #[tokio::test]
+async fn stop_sending_is_observable_at_connection_level_while_writing() {
+    // MOQT のように接続単位で STOP_SENDING を待つ利用側を想定する。送信ストリームを
+    // 所有するタスクが write のために &mut を握っていても、別タスクが Arc で共有した
+    // Connection の recv_stop_sending を同時に待てることを検証する。
+    let (client, server) = pair();
+    let client = Arc::new(client);
+
+    // 接続単位の観測タスク。送信ストリームには触れない
+    let observer = Arc::clone(&client);
+    let observe_task = tokio::spawn(async move {
+        observer
+            .recv_stop_sending()
+            .await
+            .expect("受信に失敗しない")
+            .expect("STOP_SENDING が届く")
+    });
+
+    // 送信側は書き込みのため SendStream を &mut で保持し続ける
+    let (mut send, _recv) = client.open_bidirectional().await.expect("開ける");
+    send.write(b"hello").await.expect("書き込める");
+    let (_send, mut recv) = server
+        .accept_bidirectional()
+        .await
+        .expect("accept に失敗しない")
+        .expect("ストリームが届く");
+
+    recv.stop_sending(0x42)
+        .await
+        .expect("STOP_SENDING を送れる");
+
+    let observed = observe_task.await.expect("タスクが終了する");
+    assert_eq!(observed.id, send.id(), "対象のストリーム ID が一致すること");
+    assert_eq!(observed.error_code, 0x42, "エラーコードが一致すること");
+
+    // 送信側は送信停止を検出して次の write が失敗する
+    match send.write(b"ignored").await {
+        Err(Error::Stopped(code)) => assert_eq!(code, 0x42, "エラーコードが一致すること"),
+        other => panic!("Stopped を期待したが {other:?} だった"),
+    }
+}
+
+#[tokio::test]
 async fn datagram_is_delivered() {
     let (client, server) = pair();
 
