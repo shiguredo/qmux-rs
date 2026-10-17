@@ -25,5 +25,3 @@ exclude = ["fuzz"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.95"
-
-[dependencies]

@@ -9,11 +9,13 @@ use pbt::common::sample_bytes;
 use pbt::common::sample_varint;
 use pbt::common::test_runner;
 use shiguredo_qmux::codec::frame::Frame;
+use shiguredo_qmux::codec::frame::connection_close::ConnectionClose;
 use shiguredo_qmux::codec::frame::data_blocked::DataBlocked;
 use shiguredo_qmux::codec::frame::datagram::Datagram;
 use shiguredo_qmux::codec::frame::max_data::MaxData;
 use shiguredo_qmux::codec::frame::max_stream_data::MaxStreamData;
 use shiguredo_qmux::codec::frame::max_streams::MaxStreams;
+use shiguredo_qmux::codec::frame::padding::Padding;
 use shiguredo_qmux::codec::frame::reset_stream::ResetStream;
 use shiguredo_qmux::codec::frame::stop_sending::StopSending;
 use shiguredo_qmux::codec::frame::stream::Stream;
@@ -29,7 +31,14 @@ use shiguredo_qmux::frame::decode_record;
 use shiguredo_qmux::transport_params::MAX_STREAMS_LIMIT;
 
 /// 生成対象のフレーム種別の数 (カバレッジゲート用)
-const FRAME_KIND_COUNT: usize = 12;
+const FRAME_KIND_COUNT: usize = 14;
+
+/// Record 内の複数フレームのテストで生成する種別
+///
+/// PADDING は連続すると 1 つのフレームに融合してデコードされる (RFC 9000
+/// Section 19.1) ため、複数フレームのラウンドトリップでは生成しない。
+/// PADDING 自体は単体のラウンドトリップで検証する。
+const RECORD_FRAME_KINDS: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13];
 
 /// PBT で扱うフレームのペイロード長の上限
 const MAX_FRAME_PAYLOAD_LEN: usize = 256;
@@ -61,14 +70,32 @@ fn sample_varint_value(ctx: &mut noprop::TestCaseContext) -> VarInt {
     VarInt::new(sample_varint(ctx)).expect("0..=2^62-1 の値なので VarInt を作れる")
 }
 
+/// `1..=max` の長さを生成する
+///
+/// 1 と最大長は一様分布では出にくいため、明示的な境界値として混ぜる。
+fn sample_len_at_least_one(ctx: &mut noprop::TestCaseContext, max: usize) -> usize {
+    noprop::sample_with_boundaries(ctx, &[1usize, max], noprop::Ratio::one_nth(4), |ctx| {
+        noprop::sample_usize_in(ctx, 1..=max)
+    })
+}
+
 /// QMux で送受信するフレームを 1 つ生成する
+///
+/// 生成対象の全種別を等確率で選ぶ。
+fn sample_qmux_frame(ctx: &mut noprop::TestCaseContext) -> QmuxFrame {
+    let kind = noprop::sample_weighted_index(ctx, &[1u32; FRAME_KIND_COUNT]);
+    sample_qmux_frame_of_kind(ctx, kind)
+}
+
+/// 種別番号を指定してフレームを 1 つ生成する
 ///
 /// QX_TRANSPORT_PARAMETERS / QX_PING と、QMux で利用が許可された QUIC version 1 の
 /// フレーム (STREAM / MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS / DATA_BLOCKED /
-/// STREAM_DATA_BLOCKED / STREAMS_BLOCKED / RESET_STREAM / STOP_SENDING / DATAGRAM) を
-/// 等確率で生成する。値はすべて可変長整数で表現できる範囲に収める。
-fn sample_qmux_frame(ctx: &mut noprop::TestCaseContext) -> QmuxFrame {
-    match noprop::sample_weighted_index(ctx, &[1u32; FRAME_KIND_COUNT]) {
+/// STREAM_DATA_BLOCKED / STREAMS_BLOCKED / RESET_STREAM / STOP_SENDING / DATAGRAM /
+/// PADDING / CONNECTION_CLOSE) を生成する。値はすべて可変長整数で表現できる範囲に
+/// 収める。
+fn sample_qmux_frame_of_kind(ctx: &mut noprop::TestCaseContext, kind: usize) -> QmuxFrame {
+    match kind {
         0 => QmuxFrame::TransportParameters(QxTransportParameters {
             // デコード側はトランスポートパラメータの中身を解釈しないため任意バイト列でよい
             params: sample_bytes(ctx, MAX_FRAME_PAYLOAD_LEN),
@@ -125,13 +152,38 @@ fn sample_qmux_frame(ctx: &mut noprop::TestCaseContext) -> QmuxFrame {
             stream_id: sample_varint(ctx),
             application_protocol_error_code: sample_varint(ctx),
         })),
-        _ => QmuxFrame::Quic(Frame::Datagram(Datagram {
+        11 => QmuxFrame::Quic(Frame::Datagram(Datagram {
             data: sample_bytes(ctx, MAX_FRAME_PAYLOAD_LEN),
         })),
+        12 => QmuxFrame::Quic(Frame::Padding(Padding {
+            // RFC 9000 Section 19.1: 長さ 0 の PADDING はバイト列を生まないため生成しない
+            length: sample_len_at_least_one(ctx, MAX_FRAME_PAYLOAD_LEN),
+        })),
+        13 => {
+            // RFC 9000 Section 19.19: 0x1c (トランスポートエラー) はエラーを引き起こした
+            // フレームタイプを持ち、0x1d (アプリケーションエラー) は持たない。
+            // encode と decode が一致する組み合わせだけを生成する。
+            let application = noprop::sample_bool(ctx);
+            let frame_type = if application {
+                None
+            } else {
+                Some(sample_varint(ctx))
+            };
+            QmuxFrame::Quic(Frame::ConnectionClose(ConnectionClose {
+                application,
+                error_code: sample_varint(ctx),
+                frame_type,
+                reason_phrase: sample_bytes(ctx, MAX_FRAME_PAYLOAD_LEN),
+            }))
+        }
+        other => panic!("生成対象外の種別番号が渡された: {other}"),
     }
 }
 
 /// 生成したフレームの種別番号を返す (カバレッジゲート用)
+///
+/// 生成対象の全種別を網羅する。新しいフレーム種別を追加したときは、
+/// 種別番号を足すまでコンパイルできなくなる。
 fn frame_kind(frame: &QmuxFrame) -> usize {
     match frame {
         QmuxFrame::TransportParameters(_) => 0,
@@ -146,7 +198,8 @@ fn frame_kind(frame: &QmuxFrame) -> usize {
         QmuxFrame::Quic(Frame::ResetStream(_)) => 9,
         QmuxFrame::Quic(Frame::StopSending(_)) => 10,
         QmuxFrame::Quic(Frame::Datagram(_)) => 11,
-        other => panic!("生成対象外のフレームが観測された: {other:?}"),
+        QmuxFrame::Quic(Frame::Padding(_)) => 12,
+        QmuxFrame::Quic(Frame::ConnectionClose(_)) => 13,
     }
 }
 
@@ -190,7 +243,13 @@ fn decode_record_roundtrip() -> noprop::TestResult {
             noprop::sample_with_boundaries(ctx, &[1usize, 8], noprop::Ratio::one_nth(4), |ctx| {
                 noprop::sample_usize_in(ctx, 1..=8)
             });
-        let frames: Vec<QmuxFrame> = (0..count).map(|_| sample_qmux_frame(ctx)).collect();
+        let frames: Vec<QmuxFrame> = (0..count)
+            .map(|_| {
+                let kind =
+                    RECORD_FRAME_KINDS[noprop::sample_usize_in(ctx, 0..RECORD_FRAME_KINDS.len())];
+                sample_qmux_frame_of_kind(ctx, kind)
+            })
+            .collect();
 
         let mut buf = Vec::new();
         for frame in &frames {

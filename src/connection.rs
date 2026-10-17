@@ -13,7 +13,7 @@ use crate::codec::role::Role;
 use crate::codec::time::{Duration, Timestamp};
 use crate::codec::varint::VarInt;
 
-use crate::config::Config;
+use crate::config::{Config, MAX_CONFIG_STREAMS};
 use crate::event::{CloseReason, Event};
 use crate::frame::{QmuxFrame, QxPing, QxTransportParameters};
 use crate::record::{self, RecordDecoder};
@@ -48,8 +48,6 @@ enum State {
 /// 使い方はクレートのドキュメントを参照。
 #[derive(Debug)]
 pub struct Connection {
-    /// 接続のロール
-    role: Role,
     /// 設定
     config: Config,
     /// ローカルのトランスポートパラメータ
@@ -76,6 +74,11 @@ pub struct Connection {
     greatest_ping_acknowledged: Option<u64>,
     /// 最後に受信した QX_PING の要求のシーケンス番号
     last_ping_request: Option<u64>,
+    /// まだ応答していない QX_PING の要求のうち、最大のシーケンス番号
+    ///
+    /// 応答前に複数の要求を受信した場合は 1 件に合算する (Section 4.3 の MAY)。
+    /// 実際の応答フレームは [`Connection::poll_transmit`] で 1 件だけ積む。
+    pending_ping_response: Option<u64>,
     /// 最後に Record を完全に送受信した時刻 (アイドルタイマーの起点)
     last_activity: Option<Timestamp>,
     /// アプリケーションへ未配送の DATAGRAM の個数
@@ -94,8 +97,28 @@ impl Connection {
     ///
     /// 送信できない設定 (max_record_size が既定値未満、可変長整数で表現できない値
     /// など) の場合は [`crate::codec::error::Error::InvalidData`] を返す。
+    /// ストリーム数の初期値が [`MAX_CONFIG_STREAMS`] を超える場合も同様に拒否する。
     pub fn new(role: Role, config: Config) -> Result<Self, Error> {
         let local_params = config.transport_parameters();
+
+        // ピアは 1 つの MAX_STREAMS フレームで上限までストリームを開けるため、
+        // 自エンドポイントが広告する初期値に実用上限を設ける
+        // (draft-ietf-quic-qmux-02 Section 12.1, Section 12.2 の資源枯渇対策)。
+        // ピアから受信した値には上限を課さない (RFC 9000 Section 4.6 は 2^60 まで
+        // 許容する)。
+        if local_params.initial_max_streams_bidi > MAX_CONFIG_STREAMS {
+            return Err(Error::InvalidData(format!(
+                "initial_max_streams_bidi {} exceeds the maximum {MAX_CONFIG_STREAMS}",
+                local_params.initial_max_streams_bidi
+            )));
+        }
+        if local_params.initial_max_streams_uni > MAX_CONFIG_STREAMS {
+            return Err(Error::InvalidData(format!(
+                "initial_max_streams_uni {} exceeds the maximum {MAX_CONFIG_STREAMS}",
+                local_params.initial_max_streams_uni
+            )));
+        }
+
         // 誤設定を最初の送信まで遅延させないため、ここで一度エンコードして検証する。
         // ここを通れば poll_transmit での QX_TRANSPORT_PARAMETERS のエンコードは
         // 失敗しない。
@@ -104,7 +127,6 @@ impl Connection {
         let decoder = RecordDecoder::new(local_params.max_record_size);
         let streams = StreamManager::new(role, &local_params);
         Ok(Self {
-            role,
             config,
             local_params,
             state: State::Handshaking,
@@ -118,16 +140,12 @@ impl Connection {
             greatest_ping_sent: None,
             greatest_ping_acknowledged: None,
             last_ping_request: None,
+            pending_ping_response: None,
             last_activity: None,
             queued_datagrams: 0,
             queued_datagram_bytes: 0,
             dropped_datagrams: 0,
         })
-    }
-
-    /// 接続のロールを返す
-    pub fn role(&self) -> Role {
-        self.role
     }
 
     /// ローカルのトランスポートパラメータを返す
@@ -201,9 +219,28 @@ impl Connection {
     ///
     /// 最初の呼び出しでは QX_TRANSPORT_PARAMETERS フレームだけを含む Record を
     /// 書き出す (Section 4.2)。
+    ///
+    /// 未応答の QX_PING の要求がある場合は、この呼び出しで応答フレームを 1 件
+    /// 積む (Section 4.3)。
     pub fn poll_transmit(&mut self, buf: &mut Vec<u8>, now: Timestamp) -> Result<bool, Error> {
         if self.state == State::Closed {
             return Ok(false);
+        }
+
+        // Section 4.3: 応答前に複数の QX_PING の要求を受信していても、応答は
+        // 受信した最大のシーケンス番号を持つ 1 件に合算する (MAY)。要求ごとに
+        // 応答フレームを積むと、ピアが要求を連投するだけで送信待ちフレームが
+        // 無制限に増える (Section 12.2)。切断が確定した後は応答しない。
+        if !self.is_closed()
+            && let Some(sequence) = self.pending_ping_response.take()
+        {
+            let mut encoded = Vec::new();
+            QmuxFrame::Ping(QxPing::Response {
+                sequence: VarInt::try_from(sequence)
+                    .expect("QX_PING sequence received as a variable-length integer fits in one"),
+            })
+            .encode(&mut encoded);
+            self.streams.pending_frames.push_back(encoded);
         }
 
         // Section 4.2: QX_TRANSPORT_PARAMETERS は最初のフレームとして、下位
@@ -349,6 +386,11 @@ impl Connection {
     }
 
     /// ストリームの受信側に送信停止を要求する (STOP_SENDING を送る)
+    ///
+    /// アプリケーションがすべてのデータを読み取った後 ("Data Recvd" にあたる
+    /// [`crate::stream::RecvState::DataRead`]) でも送信する。RFC 9000 Section 3.3 は
+    /// この状態での STOP_SENDING を MAY としつつ「little value」と述べているが、
+    /// 本実装では読み取りを止めたことをピアへ明示するため抑止しない。
     pub fn stop_sending(&mut self, id: StreamId, error_code: u64) -> Result<(), Error> {
         self.ensure_open()?;
         self.streams.stop_sending(id, error_code)
@@ -575,15 +617,16 @@ impl Connection {
                 }
                 self.last_ping_request = Some(sequence);
 
-                // 受け取ったシーケンス番号をそのまま返す
-                let mut encoded = Vec::new();
-                QmuxFrame::Ping(QxPing::Response {
-                    sequence: VarInt::try_from(sequence).expect(
-                        "QX_PING sequence received as a variable-length integer fits in one",
-                    ),
-                })
-                .encode(&mut encoded);
-                self.streams.pending_frames.push_back(encoded);
+                // Section 4.3: 応答前に複数の要求を受信した場合、受信した最大の
+                // シーケンス番号を持つ 1 件だけを応答してよい (MAY)。ここでは最大の
+                // シーケンス番号だけを保持し、実際の応答フレームは poll_transmit で
+                // 1 件だけ積む。要求ごとに積むと、ピアが要求を連投するだけで送信待ち
+                // フレームが無制限に増える (Section 12.2)。
+                self.pending_ping_response = Some(match self.pending_ping_response {
+                    Some(previous) => core::cmp::max(previous, sequence),
+                    None => sequence,
+                });
+                // 要求はすべてアプリケーションへ通知する (合算するのは応答だけ)
                 self.events.push_back(Event::Ping { sequence });
             }
             QxPing::Response { sequence } => {
@@ -713,6 +756,12 @@ impl Connection {
     ///
     /// TCP のリセットや TLS の fatal alert など、下位トランスポートが利用できなく
     /// なったときに呼び出す。QMux の接続は即座に終了する。
+    ///
+    /// 送信待ちのフレームを破棄し、[`Event::ConnectionClosed`] を
+    /// [`CloseReason::TransportClosed`] で 1 回だけ通知する。以降は
+    /// [`Connection::is_closed`] が `true` を返し、[`Connection::receive`] に渡された
+    /// データは破棄され、アプリケーションの操作はエラーになる。2 回目以降の
+    /// 呼び出しは何もしない (通知は重複しない)。
     pub fn transport_closed(&mut self) {
         if self.is_closed() {
             return;

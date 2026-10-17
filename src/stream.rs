@@ -220,6 +220,10 @@ struct Stream {
     reset_error_code: Option<u64>,
     /// 読み取り可能イベントを通知済みかどうか (同じ読み取り状態での重複通知の抑止)
     readable_notified: bool,
+    /// STOP_SENDING をアプリケーションへ通知済みかどうか (再受信の冪等性のため)
+    stop_sending_notified: bool,
+    /// 書き込み可能イベントを通知済みかどうか (同じクレジットでの重複通知の抑止)
+    writable_notified: bool,
 }
 
 impl Stream {
@@ -292,6 +296,10 @@ pub(crate) struct StreamManager {
     last_streams_blocked_bidi: Option<u64>,
     /// 最後に STREAMS_BLOCKED を送った上限 (単方向)
     last_streams_blocked_uni: Option<u64>,
+    /// 双方向ストリームの上限増加を通知済みかどうか (重複通知の抑止)
+    streams_available_notified_bidi: bool,
+    /// 単方向ストリームの上限増加を通知済みかどうか (重複通知の抑止)
+    streams_available_notified_uni: bool,
     /// ピアのトランスポートパラメータを受信済みかどうか
     peer_params_received: bool,
     /// ピアが広告した QMux Record の Size の上限
@@ -335,6 +343,8 @@ impl StreamManager {
             peer_uni_created: 0,
             last_streams_blocked_bidi: None,
             last_streams_blocked_uni: None,
+            streams_available_notified_bidi: false,
+            streams_available_notified_uni: false,
             peer_params_received: false,
             // ピアの max_record_size を受信するまでは既定値を送信の上限に使う。
             // 広告される値は既定値以上でなければならない (Section 5.2) ため、
@@ -382,8 +392,27 @@ impl StreamManager {
     }
 
     /// アプリケーションへ通知するイベントを 1 つ取り出す
+    ///
+    /// 通知の抑止に使うフラグは、通知をアプリケーションへ渡した時点で戻す
+    /// (同じ通知が未配送のまま積み重ならないようにするため)。
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        match &event {
+            Event::StreamWritable { id } => {
+                if let Some(stream) = self.streams.get_mut(id) {
+                    stream.writable_notified = false;
+                }
+            }
+            Event::StreamsAvailable { bidirectional } => {
+                if *bidirectional {
+                    self.streams_available_notified_bidi = false;
+                } else {
+                    self.streams_available_notified_uni = false;
+                }
+            }
+            _ => {}
+        }
+        Some(event)
     }
 
     /// ローカル起動のストリームを開く
@@ -466,13 +495,19 @@ impl StreamManager {
                 final_size: None,
                 reset_error_code: None,
                 readable_notified: false,
+                stop_sending_notified: false,
+                writable_notified: false,
             },
         );
 
         if bidirectional {
             self.next_local_bidi += 1;
+            // アプリケーションがストリームを開いたので、上限増加を改めて通知できる
+            self.streams_available_notified_bidi = false;
         } else {
             self.next_local_uni += 1;
+            // アプリケーションがストリームを開いたので、上限増加を改めて通知できる
+            self.streams_available_notified_uni = false;
         }
         Ok(id)
     }
@@ -505,6 +540,9 @@ impl StreamManager {
                     reason: format!("stream {} is closed for sending", id.as_u64()),
                 });
             }
+            // アプリケーションが書き込みを試みたので、書き込み可能通知を改めて
+            // 送れるようにする (同じクレジットでの重複通知の抑止を解く)
+            stream.writable_notified = false;
             if data.is_empty() && !fin {
                 return Ok(0);
             }
@@ -554,6 +592,11 @@ impl StreamManager {
     ///
     /// 読み取ったバイト数に応じてフロー制御クレジット (MAX_STREAM_DATA /
     /// MAX_DATA) をピアへ返す。
+    ///
+    /// ピアが RESET_STREAM を送ったストリームでは [`ReadResult::Reset`] を返し、
+    /// 受信側を終端させる。送信側も終端していればストリームを破棄するため、
+    /// 破棄後の読み取りは [`ReadResult::Data`] (`len` が 0、`fin` が true) になる
+    /// (RFC 9000 Section 3.2)。
     pub(crate) fn read(&mut self, id: StreamId, buf: &mut [u8]) -> Result<ReadResult, Error> {
         // ストリームの状態更新をブロックに閉じ込め、借用をクレジット更新の
         // フレーム追加より先に終わらせる
@@ -577,63 +620,79 @@ impl StreamManager {
             };
 
             match recv_state {
-                // RESET_STREAM をアプリケーションが観測した (RFC 9000 Section 3.2)
+                // RESET_STREAM をアプリケーションが観測した (RFC 9000 Section 3.2)。
+                // 観測した時点で受信側は終端する。送信側も終端していれば、末尾の
+                // finish_stream がストリームを破棄し、ピア起動であれば MAX_STREAMS を
+                // 返す。破棄後の読み取りは was_created 経由で EOF になる。
                 RecvState::ResetRecvd => {
                     stream.recv_state = Some(RecvState::ResetRead);
-                    return Ok(ReadResult::Reset {
-                        error_code: stream.reset_error_code.unwrap_or(0),
-                    });
+                    (
+                        ReadResult::Reset {
+                            error_code: stream.reset_error_code.unwrap_or(0),
+                        },
+                        None,
+                        0,
+                        true,
+                    )
                 }
-                // 観測済みのリセットは繰り返し通知する (アプリケーションは冪等に扱える)
-                RecvState::ResetRead => {
-                    return Ok(ReadResult::Reset {
+                // 観測済みのリセットは繰り返し通知する (アプリケーションは冪等に
+                // 扱える)。送信側が未終端でストリームが残っている場合だけここに来る。
+                RecvState::ResetRead => (
+                    ReadResult::Reset {
                         error_code: stream.reset_error_code.unwrap_or(0),
-                    });
-                }
+                    },
+                    None,
+                    0,
+                    true,
+                ),
                 // すべて読み取り済み
                 RecvState::DataRead => {
                     return Ok(ReadResult::Data { len: 0, fin: true });
                 }
-                RecvState::Recv | RecvState::SizeKnown => {}
-            }
+                RecvState::Recv | RecvState::SizeKnown => {
+                    let len = core::cmp::min(buf.len(), stream.recv_buffer.len());
+                    for (index, byte) in stream.recv_buffer.drain(..len).enumerate() {
+                        buf[index] = byte;
+                    }
+                    stream.read_offset += len as u64;
 
-            let len = core::cmp::min(buf.len(), stream.recv_buffer.len());
-            for (index, byte) in stream.recv_buffer.drain(..len).enumerate() {
-                buf[index] = byte;
-            }
-            stream.read_offset += len as u64;
+                    // ストリーム単位のクレジット更新 (RFC 9000 Section 4.1)。
+                    // Recv 状態でのみ MAX_STREAM_DATA を送る
+                    // (最終サイズが確定した後は不要)。
+                    let mut max_stream_data = None;
+                    if len > 0 && recv_state == RecvState::Recv && stream.recv_window > 0 {
+                        let remaining = stream.recv_max_data - stream.read_offset;
+                        if remaining <= stream.recv_window / 2 {
+                            stream.recv_max_data = stream.read_offset + stream.recv_window;
+                            max_stream_data = Some(Frame::MaxStreamData(
+                                frame::max_stream_data::MaxStreamData {
+                                    stream_id: id.as_u64(),
+                                    maximum_stream_data: stream.recv_max_data,
+                                },
+                            ));
+                        }
+                    }
 
-            // ストリーム単位のクレジット更新 (RFC 9000 Section 4.1)。
-            // Recv 状態でのみ MAX_STREAM_DATA を送る (最終サイズが確定した後は不要)。
-            let mut max_stream_data = None;
-            if len > 0 && recv_state == RecvState::Recv && stream.recv_window > 0 {
-                let remaining = stream.recv_max_data - stream.read_offset;
-                if remaining <= stream.recv_window / 2 {
-                    stream.recv_max_data = stream.read_offset + stream.recv_window;
-                    max_stream_data = Some(Frame::MaxStreamData(
-                        frame::max_stream_data::MaxStreamData {
-                            stream_id: id.as_u64(),
-                            maximum_stream_data: stream.recv_max_data,
-                        },
-                    ));
+                    // 未読のデータが残っている間は StreamReadable を再通知しない。
+                    // 読み切ったら (read が len 0 を返すまで読んだら)、次のデータ
+                    // 到着時に改めて通知できるようにする。
+                    if stream.recv_buffer.is_empty() {
+                        stream.readable_notified = false;
+                    }
+
+                    let finished =
+                        recv_state == RecvState::SizeKnown && stream.recv_buffer.is_empty();
+                    if finished {
+                        stream.recv_state = Some(RecvState::DataRead);
+                    }
+                    (
+                        ReadResult::Data { len, fin: finished },
+                        max_stream_data,
+                        len as u64,
+                        finished,
+                    )
                 }
             }
-
-            // 読み切ったら、次のデータ到着時に改めて通知できるようにする
-            if stream.recv_buffer.is_empty() {
-                stream.readable_notified = false;
-            }
-
-            let finished = recv_state == RecvState::SizeKnown && stream.recv_buffer.is_empty();
-            if finished {
-                stream.recv_state = Some(RecvState::DataRead);
-            }
-            (
-                ReadResult::Data { len, fin: finished },
-                max_stream_data,
-                len as u64,
-                finished,
-            )
         };
 
         if let Some(frame) = max_stream_data {
@@ -949,6 +1008,14 @@ impl StreamManager {
             });
         };
 
+        // RFC 9000 Section 12.4: フレームは冪等でなければならない。同じ
+        // STOP_SENDING を再受信しても状態とイベントは変えずに無視する。
+        // 再通知すると、アプリケーション側の保留キューがピアの連投で増え続ける。
+        if stream.stop_sending_notified {
+            return Ok(());
+        }
+        stream.stop_sending_notified = true;
+
         // Ready 状態のストリームでは RESET_STREAM を送って送信側を終了させる
         // (RFC 9000 Section 3.5)。すでに送信を終えたストリームでは何もしない。
         if send_state == SendState::Ready {
@@ -987,13 +1054,23 @@ impl StreamManager {
         // あり、複数ストリームでクレジットを分け合っている場合、send_offset が上限
         // 未満でも接続クレジットで止まっているストリームを取りこぼしうる。通知は
         // 助言であり、アプリが write を再試行すれば進むため、ここでは近似的に絞る。
+        // 同じストリームへの通知が未配送のまま残っている場合は積み増さない
+        // (draft-ietf-quic-qmux-02 Section 12.2 は小さなフロー制御更新の連投を
+        //  資源消費の例として挙げている)。
         let writable: Vec<StreamId> = self
             .streams
             .values()
-            .filter(|s| s.send_state == Some(SendState::Ready) && s.send_offset >= previous_limit)
+            .filter(|s| {
+                s.send_state == Some(SendState::Ready)
+                    && s.send_offset >= previous_limit
+                    && !s.writable_notified
+            })
             .map(|s| s.id)
             .collect();
         for id in writable {
+            if let Some(stream) = self.streams.get_mut(&id) {
+                stream.writable_notified = true;
+            }
             self.events.push_back(Event::StreamWritable { id });
         }
     }
@@ -1030,7 +1107,14 @@ impl StreamManager {
         }
         stream.send_max_data = f.maximum_stream_data;
         stream.last_stream_data_blocked = None;
-        self.events.push_back(Event::StreamWritable { id });
+        // 送信側が終端したストリームには通知しない (on_max_data と同じ条件)。
+        // また、同じストリームへの通知が未配送のまま残っている場合は積み増さない
+        // (draft-ietf-quic-qmux-02 Section 12.2 は小さなフロー制御更新の連投を
+        //  資源消費の例として挙げている)。
+        if stream.send_state == Some(SendState::Ready) && !stream.writable_notified {
+            stream.writable_notified = true;
+            self.events.push_back(Event::StreamWritable { id });
+        }
         Ok(())
     }
 
@@ -1064,10 +1148,20 @@ impl StreamManager {
         }
         *limit = f.maximum_streams;
         *last = None;
-        // ストリームを開けるようになったことをアプリケーションへ通知する
-        self.events.push_back(Event::StreamsAvailable {
-            bidirectional: f.bidirectional,
-        });
+        // ストリームを開けるようになったことをアプリケーションへ通知する。
+        // 同じ方向への通知が未配送のまま残っている場合は積み増さない
+        // (draft-ietf-quic-qmux-02 Section 12.2 の資源消費対策)。
+        let notified = if f.bidirectional {
+            &mut self.streams_available_notified_bidi
+        } else {
+            &mut self.streams_available_notified_uni
+        };
+        if !*notified {
+            *notified = true;
+            self.events.push_back(Event::StreamsAvailable {
+                bidirectional: f.bidirectional,
+            });
+        }
         Ok(())
     }
 
@@ -1195,6 +1289,10 @@ impl StreamManager {
         } else {
             self.local_max_streams_uni
         };
+        // ここでは 1 つのフレームで、飛ばされた番号のストリームも含めて上限まで
+        // まとめて作成する。広告する上限に [`crate::config::MAX_CONFIG_STREAMS`] の
+        // 実用上限を設けているのはこのためである
+        // (draft-ietf-quic-qmux-02 Section 12.1, Section 12.2 の資源枯渇対策)。
         if sequence >= limit {
             return Err(Error::Protocol {
                 code: TransportErrorCode::STREAM_LIMIT_ERROR,
@@ -1270,6 +1368,8 @@ impl StreamManager {
                 final_size: None,
                 reset_error_code: None,
                 readable_notified: false,
+                stop_sending_notified: false,
+                writable_notified: false,
             },
         );
     }
@@ -1295,6 +1395,12 @@ impl StreamManager {
         if !peer_initiated {
             return;
         }
+        // 上限を増やしてから MAX_STREAMS を送るため、内部カウンタはピアが観測した
+        // 「送信済みの上限」より先行して増える。ピアがその上限を超えてストリームを
+        // 開いた場合、RFC 9000 Section 4.6 の「the limit it has sent」の厳密な解釈
+        // では STREAM_LIMIT_ERROR とすべきだが、本実装は create_peer_streams で
+        // 先行した local_max_streams_* と比較するため受理する (寛容側。エラーに
+        // しない判断である)。
         let maximum_streams = if id.stream_type().is_bidirectional() {
             // RFC 9000 Section 4.6: 2^60 を超える上限は送信できないため飽和させる
             self.local_max_streams_bidi = (self.local_max_streams_bidi + 1).min(MAX_STREAMS_LIMIT);

@@ -1,4 +1,4 @@
-.PHONY: test interop-test pbt check clippy fmt fuzzing fuzzing-list clean
+.PHONY: test interop-test pbt check clippy fmt fmt-fix fuzz-check fuzz-clippy fuzz-fmt fuzzing fuzzing-list clean
 
 # 全テストを実行する
 test:
@@ -25,15 +25,32 @@ fuzzing-list:
 
 # cargo check を実行する
 check:
-	cargo check --workspace
+	cargo check --workspace --all-targets
 
 # cargo clippy を実行する
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# cargo fmt を実行する
+# cargo fmt で整形の検査をする
 fmt:
+	cargo fmt --all -- --check
+
+# cargo fmt で整形する
+fmt-fix:
 	cargo fmt --all
+
+# fuzz クレートの fmt 検査と check を実行する (CI の「Check fuzz crate」に対応)
+fuzz-check:
+	cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+	cargo check --manifest-path fuzz/Cargo.toml
+
+# fuzz クレートの clippy を実行する
+fuzz-clippy:
+	cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+# fuzz クレートを cargo fmt で整形する
+fuzz-fmt:
+	cargo fmt --manifest-path fuzz/Cargo.toml
 
 # ビルド成果物を削除する
 clean:

@@ -6,14 +6,11 @@
 //!
 //! ビルドには git、C11 コンパイラ、libclang (bindgen 用) が必要である。
 
-// bindgen が生成する bindings は C の命名規則に従い、使われない宣言も含む。
-// 生成コードに限り命名・dead_code・clippy の lint を許可する。
-#![allow(
-    non_snake_case,
-    non_upper_case_globals,
-    non_camel_case_types,
-    dead_code,
-    clippy::all
-)]
+// 生成コードは C の命名規則に従うため、型名と定数の命名の lint だけを抑止する。
+// 同じ目的で抑止しうる `non_snake_case` と `dead_code` は、生成コードでは発火
+// しないため指定しない (`expect` は発火しない lint を書くと
+// `unfulfilled_lint_expectations` で失敗する)。clippy の lint も生成コードでは
+// 発火しないことを `cargo clippy --all-targets -- -D warnings` で確認している。
+#![expect(non_upper_case_globals, non_camel_case_types)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

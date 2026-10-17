@@ -190,9 +190,9 @@ fn decode_rejects_empty_record() {
 }
 
 #[test]
-fn decode_rejects_non_minimal_size_for_oversized_record() {
-    // Size を 4 バイトでエンコードしても上限検査は同じように働く
-    // (最小値は 4 バイト形式で 0x80000000、値は 200)
+fn decode_applies_max_size_to_four_byte_size_form() {
+    // Size を 4 バイト形でエンコードしても上限検査は同じように働く
+    // (4 バイト形式の最小値は 0x80000000、ここでの値は 200)
     let frames = [0x88; 200];
     let buf = raw_record(&[0x80, 0x00, 0x00, 0xc8], &frames);
 
@@ -202,6 +202,23 @@ fn decode_rejects_non_minimal_size_for_oversized_record() {
         .poll_record()
         .expect_err("上限を超える Record は拒否される");
     assert_protocol_error(error, TransportErrorCode::FRAME_ENCODING_ERROR);
+}
+
+#[test]
+fn decode_accepts_non_minimal_size_varint() {
+    // RFC 9000 Section 16: 最短エンコードが要求されるのは Frame Type だけであり、
+    // Record の Size は非最短形でも受け入れる。ここでは値 10 を 2 バイト形
+    // (0x40 0x0a) でエンコードする。
+    let frames = [0x99; 10];
+    let buf = raw_record(&[0x40, 0x0a], &frames);
+
+    let mut decoder = RecordDecoder::new(DEFAULT_MAX_RECORD_SIZE);
+    decoder.extend(&buf);
+    let record = decoder
+        .poll_record()
+        .expect("デコードに失敗しない")
+        .expect("Record が完成する");
+    assert_eq!(record, frames, "非最短の Size でも Frames を取り出せること");
 }
 
 #[test]

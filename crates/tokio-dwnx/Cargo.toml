@@ -9,7 +9,7 @@ publish = false
 # dwnx の安全な Sans I/O ラッパー
 dwnx-rs = { path = "../dwnx-rs" }
 # 非同期ランタイム
-tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.53", features = ["io-util", "macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # テストで #[tokio::test] と duplex / net を使う

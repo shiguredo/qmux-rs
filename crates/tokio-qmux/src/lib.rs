@@ -10,11 +10,18 @@
 //! 複数タスクからの利用を想定し、待ち受ける系のメソッド ([`Connection::accept_bidirectional`]、
 //! [`Connection::accept_unidirectional`]、[`Connection::recv_datagram`]、
 //! [`Connection::recv_datagrams`]、[`Connection::recv_stop_sending`]、
-//! [`Connection::closed`]) は `&self` を取り、`select!` の腕に置いても安全な
-//! cancel safety を持つ。
+//! [`Connection::recv_ping_ack`]、[`Connection::closed`]) は `&self` を取り、`select!` の
+//! 腕に置いても安全な cancel safety を持つ。
 //!
 //! TLS と ALPN のネゴシエーションは呼び出し側の責務である。[`Connection::new`] には
 //! 接続済みの双方向バイトストリームを渡す。
+//!
+//! # 送信の詰まり
+//!
+//! ドライバは読み取り・書き込み・コマンド・close 要求・タイマーを 1 つの `select!` で
+//! 待つ。ピアが読み取りを止めて送信が詰まっている間も、受信・accept・コマンド・
+//! アイドルタイムアウトは進む。書きかけの Record は書き切ってから次の Record を
+//! 取り出すため、Record の境界が崩れることはない。
 //!
 //! # 接続の終了
 //!
@@ -26,8 +33,10 @@
 //! 変更できる。上限を過ぎるとドライバは下位トランスポートを閉じて終了し、
 //! [`Connection::closed`] が [`shiguredo_qmux::event::CloseReason::Local`] を返す。
 //!
-//! ピアが送ってきた CONNECTION_CLOSE (Section 7.3)、下位トランスポートの閉塞
-//! (Section 7.4)、アイドルタイムアウト (Section 7.1) では、ドライバは即座に終了する。
+//! アイドルタイムアウト (Section 7.1) とピアが送ってきた CONNECTION_CLOSE
+//! (Section 7.3) でも、送信側を shutdown してから終了する。下位トランスポートの閉塞
+//! (Section 7.4) では即座に終了する。[`Connection`] をドロップした場合は linger を
+//! 待たずに下位トランスポートを閉じて終了する。
 //!
 //! # QUIC の上で動かす場合との違い
 //!

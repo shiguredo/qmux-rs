@@ -74,7 +74,8 @@ pub struct TransportParameters {
     /// DATAGRAM フレームの最大サイズ (RFC 9221 Section 3)
     ///
     /// `None` と `Some(0)` はどちらも DATAGRAM の受信をサポートしないことを
-    /// 意味する (0 が既定値であり、非サポートを表す)。
+    /// 意味する (0 が既定値であり、非サポートを表す)。エンコードでは `None` は
+    /// パラメータを省略し、`Some(0)` は値 0 のパラメータとして送信する。
     pub max_datagram_frame_size: Option<u64>,
 }
 
@@ -246,6 +247,9 @@ impl TransportParameters {
     /// トランスポートパラメータをエンコードする
     ///
     /// 値が 0 のパラメータは既定値と同じため省略する (RFC 9000 Section 18.2)。
+    /// ただし [`TransportParameters::max_datagram_frame_size`] は例外で、`None` は
+    /// パラメータ自体を省略し、`Some(0)` は DATAGRAM の非サポートを明示するために
+    /// 値 0 のパラメータとして送信する (RFC 9221 Section 3 の既定値は 0)。
     /// 可変長整数で表現できない値、2^60 を超えるストリーム数の上限はエラーを返す。
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
         if self.max_idle_timeout != 0 {
@@ -302,6 +306,9 @@ impl TransportParameters {
             }
             encode_varint_param(buf, MAX_RECORD_SIZE_ID, self.max_record_size)?;
         }
+        // RFC 9221 Section 3: Some(0) は DATAGRAM の非サポートを明示するため、
+        // 値 0 のパラメータとして送信する。None はパラメータ自体を省略する
+        // (省略時の既定値も 0 だが、decode 側で None と Some(0) を区別できる)。
         if let Some(max_datagram_frame_size) = self.max_datagram_frame_size {
             encode_varint_param(
                 buf,
@@ -318,9 +325,6 @@ impl TransportParameters {
 /// 呼び出し前に [`is_integer_parameter`] の検査で、値が空でなく、1 つの
 /// 可変長整数として過不足なく消費されることが確認されている。
 fn decode_integer(value: &[u8]) -> Result<u64, Error> {
-    if value.is_empty() {
-        return Ok(0);
-    }
     let (v, _) = VarInt::decode(value).map_err(transport_parameter_error)?;
     Ok(v.as_u64())
 }

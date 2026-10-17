@@ -53,7 +53,7 @@ pub fn encode(frames: &[u8], max_record_size: u64, buf: &mut Vec<u8>) -> Result<
 /// QMux Record の逐次デコーダ
 ///
 /// バイトストリームから届く断片を [`RecordDecoder::extend`] で渡し、
-/// [`RecordDecoder::next`] で完成した Record の Frames フィールドを取り出す。
+/// [`RecordDecoder::poll_record`] で完成した Record の Frames フィールドを取り出す。
 ///
 /// 途中まで受信した Record を保持するバッファの大きさは、広告した
 /// `max_record_size` と、1 回の [`RecordDecoder::extend`] に渡された長さの
@@ -83,7 +83,7 @@ impl RecordDecoder {
 
     /// 受信したバイト列を追加する
     ///
-    /// 呼び出し側は、追加した後に [`RecordDecoder::next`] を呼び出して
+    /// 呼び出し側は、追加した後に [`RecordDecoder::poll_record`] を呼び出して
     /// 完成した Record を取り出し続けること。
     pub fn extend(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);

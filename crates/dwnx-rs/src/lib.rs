@@ -8,8 +8,10 @@
 
 mod config;
 mod connection;
+mod error;
 mod event;
 
-pub use config::{Config, TransportParameters};
-pub use connection::{Connection, Error};
+pub use config::{MAX_CONFIG_STREAMS, TransportParameters};
+pub use connection::{Connection, WriteEvent};
+pub use error::Error;
 pub use event::Event;

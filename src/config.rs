@@ -5,6 +5,17 @@ use crate::codec::time::Duration;
 use crate::record::DEFAULT_MAX_RECORD_SIZE;
 use crate::transport_params::TransportParameters;
 
+/// [`Config`] で指定できるストリーム数の初期値の上限
+///
+/// ピアは 1 つの MAX_STREAMS フレームで上限までストリームを開けるため、広告する
+/// 初期値が大きいほど、1 フレームで一括生成されるストリームとイベントの数が増える。
+/// [`crate::connection::Connection::new`] はこの値を超える
+/// [`Config::initial_max_streams_bidi`] / [`Config::initial_max_streams_uni`] を
+/// [`crate::codec::error::Error::InvalidData`] として拒否する
+/// (draft-ietf-quic-qmux-02 Section 12.1, Section 12.2 の資源枯渇対策)。
+/// RFC 9000 Section 4.6 が許容する 2^60 までの値をそのまま広告することはしない。
+pub const MAX_CONFIG_STREAMS: u64 = 1 << 16;
+
 /// QMux 接続の設定
 ///
 /// 値はそのまま QX_TRANSPORT_PARAMETERS フレームとしてピアへ送られる。既定値は
@@ -23,8 +34,12 @@ pub struct Config {
     /// 単方向ストリームで受信できるデータ量の初期値
     pub initial_max_stream_data_uni: u64,
     /// ピアが起動できる双方向ストリーム数の初期値
+    ///
+    /// [`MAX_CONFIG_STREAMS`] 以下でなければならない。
     pub initial_max_streams_bidi: u64,
     /// ピアが起動できる単方向ストリーム数の初期値
+    ///
+    /// [`MAX_CONFIG_STREAMS`] 以下でなければならない。
     pub initial_max_streams_uni: u64,
     /// ピアが送信できる QMux Record の Size の上限 (Section 5.2)
     ///

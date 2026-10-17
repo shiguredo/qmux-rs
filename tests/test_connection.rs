@@ -9,10 +9,10 @@ use shiguredo_qmux::codec::frame::{self, Frame};
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::{Duration, Timestamp};
 use shiguredo_qmux::codec::varint::VarInt;
-use shiguredo_qmux::config::Config;
+use shiguredo_qmux::config::{Config, MAX_CONFIG_STREAMS};
 use shiguredo_qmux::connection::Connection;
 use shiguredo_qmux::event::{CloseReason, Event};
-use shiguredo_qmux::frame::{QmuxFrame, QxPing, QxTransportParameters};
+use shiguredo_qmux::frame::{QmuxFrame, QxPing, QxTransportParameters, decode_record};
 use shiguredo_qmux::record::{DEFAULT_MAX_RECORD_SIZE, RecordDecoder, encode as encode_record};
 use shiguredo_qmux::stream::{ReadResult, StreamId};
 
@@ -166,6 +166,25 @@ fn transfer_records_to_server(pair: &mut Pair) -> Vec<Vec<u8>> {
     records
 }
 
+/// 送信待ちの Record をすべて取り出し、フレーム列へ分解する
+///
+/// 相手へ渡さずに、送信側が積んだフレーム (MAX_STREAMS やブロック通知など) を
+/// 検証するために使う。poll_transmit は 1 回につき 1 つの Record を追記するため、
+/// false が返るまで繰り返し、Record の境界で Frames を取り出す。
+fn take_frames(conn: &mut Connection) -> Vec<QmuxFrame> {
+    let mut buf = Vec::new();
+    while conn.poll_transmit(&mut buf, NOW).expect("送信に失敗した") {}
+
+    // テスト側で Record の境界を確認するため、上限を十分大きくしたデコーダを使う
+    let mut decoder = RecordDecoder::new(1 << 24);
+    decoder.extend(&buf);
+    let mut frames = Vec::new();
+    while let Some(record) = decoder.poll_record().expect("Record を取り出せる") {
+        frames.extend(decode_record(&record).expect("フレーム列を取り出せる"));
+    }
+    frames
+}
+
 /// ストリームから読み取れるデータをすべて読み取る
 ///
 /// 戻り値は (読み取ったデータ, FIN まで到達したか)。データがない場合は
@@ -211,6 +230,59 @@ mod handshake {
         assert!(
             Connection::new(Role::Client, client_config).is_err(),
             "既定値未満の max_record_size は拒否されること"
+        );
+    }
+
+    #[test]
+    fn local_stream_limit_above_implementation_cap_is_rejected() {
+        // Section 12.1 / 12.2: ピアは 1 フレームで広告上限までストリームを作成できる
+        // ため、ローカルが広告する上限には実用上の上限を設ける。境界 (上限ちょうど) は
+        // 受け入れ、1 つ超える値は接続の作成時に拒否する。
+        let mut at_cap = config();
+        at_cap.initial_max_streams_bidi = MAX_CONFIG_STREAMS;
+        at_cap.initial_max_streams_uni = MAX_CONFIG_STREAMS;
+        assert!(
+            Connection::new(Role::Client, at_cap).is_ok(),
+            "上限ちょうどのストリーム数は受け入れること"
+        );
+
+        let mut bidi_over = config();
+        bidi_over.initial_max_streams_bidi = MAX_CONFIG_STREAMS + 1;
+        let error = Connection::new(Role::Client, bidi_over)
+            .expect_err("上限を超える双方向ストリーム数は拒否される");
+        assert!(
+            matches!(error, Error::InvalidData(_)),
+            "ローカルの設定エラーとして扱うこと: {error:?}"
+        );
+
+        let mut uni_over = config();
+        uni_over.initial_max_streams_uni = MAX_CONFIG_STREAMS + 1;
+        let error = Connection::new(Role::Server, uni_over)
+            .expect_err("上限を超える単方向ストリーム数は拒否される");
+        assert!(
+            matches!(error, Error::InvalidData(_)),
+            "ローカルの設定エラーとして扱うこと: {error:?}"
+        );
+
+        // 受信したピアのパラメータにはこの上限を課さない (RFC 9000 Section 4.6 は
+        // 2^60 まで許容する)。ピアが大きな上限を広告しても接続は成立する。
+        let mut params = config().transport_parameters();
+        params.initial_max_streams_bidi = MAX_CONFIG_STREAMS + 1;
+        let mut encoded = Vec::new();
+        params
+            .encode(&mut encoded)
+            .expect("テスト用のトランスポートパラメータをエンコードできる");
+        let mut server =
+            Connection::new(Role::Server, config()).expect("テスト用の接続を作成できる");
+        inject(
+            &mut server,
+            &encode_qmux_frame(&QmuxFrame::TransportParameters(QxTransportParameters {
+                params: encoded,
+            })),
+        );
+        assert!(
+            !server.is_closed(),
+            "ピアが広告した大きな上限では接続を閉じないこと"
         );
     }
 
@@ -625,6 +697,57 @@ mod streams {
     }
 
     #[test]
+    fn duplicate_stop_sending_is_idempotent() {
+        // RFC 9000 Section 3.5 / 12.4: 同じストリームへの STOP_SENDING の再受信で
+        // イベントが増えず、状態も変わらないこと
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        let id = pair.client.open_bidi().expect("ストリームを開ける");
+        pair.client.write(id, b"data", false).expect("書き込める");
+        pair.transfer();
+        drain(&mut pair.client);
+
+        pair.server
+            .stop_sending(id, 0x11)
+            .expect("STOP_SENDING を送れる");
+        pair.transfer();
+        let events = drain(&mut pair.client);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::StreamStopSending { .. }))
+                .count(),
+            1,
+            "送信停止が 1 回だけ通知されること: {events:?}"
+        );
+
+        // 同じ STOP_SENDING をもう一度受け取ってもイベントは増えない
+        let duplicate = Frame::StopSending(frame::stop_sending::StopSending {
+            stream_id: id.as_u64(),
+            application_protocol_error_code: 0x11,
+        });
+        inject(&mut pair.client, &encode_frame(&duplicate));
+        let events = drain(&mut pair.client);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::StreamStopSending { .. })),
+            "再受信では送信停止を通知しないこと: {events:?}"
+        );
+        assert!(!pair.client.is_closed(), "接続は閉じないこと");
+
+        // 再受信で送信側の状態も変わらない (RESET_STREAM の再送が増えない)
+        let frames = take_frames(&mut pair.client);
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, QmuxFrame::Quic(Frame::ResetStream(_)))),
+            "再受信では RESET_STREAM を送り直さないこと: {frames:?}"
+        );
+    }
+
+    #[test]
     fn max_stream_data_creates_peer_initiated_stream() {
         // RFC 9000 Section 3.2: ピア起動の双方向ストリームでは MAX_STREAM_DATA の
         // 受信がストリームを作成する
@@ -816,6 +939,179 @@ mod flow_control {
             TransportErrorCode::STREAM_LIMIT_ERROR,
         );
     }
+
+    #[test]
+    fn blocked_writes_notify_peer_once_per_limit() {
+        // RFC 9000 Section 4.1: クレジットが尽きたら STREAM_DATA_BLOCKED と
+        // DATA_BLOCKED を送る。同じ上限では繰り返し送らない (Section 12.2)。
+        let mut server_config = config();
+        server_config.initial_max_data = 4;
+        server_config.initial_max_stream_data_bidi_remote = 2;
+        let mut pair = Pair::with_config(config(), server_config);
+        pair.handshake();
+
+        let first = pair.client.open_bidi().expect("1 つ目のストリームを開ける");
+        let second = pair.client.open_bidi().expect("2 つ目のストリームを開ける");
+        assert_eq!(
+            pair.client.write(first, b"ab", false).expect("書き込める"),
+            2,
+            "ストリームのクレジットの範囲で書き込めること"
+        );
+        assert_eq!(
+            pair.client.write(first, b"ab", false).expect("書き込める"),
+            0,
+            "ストリームのクレジットが尽きたら受け付けないこと"
+        );
+        assert_eq!(
+            pair.client.write(second, b"ab", false).expect("書き込める"),
+            2,
+            "残りの接続クレジットの範囲で書き込めること"
+        );
+        assert_eq!(
+            pair.client.write(second, b"ab", false).expect("書き込める"),
+            0,
+            "両方のクレジットが尽きたら受け付けないこと"
+        );
+
+        let frames = take_frames(&mut pair.client);
+        let stream_blocked: Vec<(u64, u64)> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                QmuxFrame::Quic(Frame::StreamDataBlocked(blocked)) => {
+                    Some((blocked.stream_id, blocked.maximum_stream_data))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stream_blocked,
+            vec![(first.as_u64(), 2), (second.as_u64(), 2)],
+            "ストリームごとに 1 回だけ STREAM_DATA_BLOCKED を送ること: {frames:?}"
+        );
+        let data_blocked: Vec<u64> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                QmuxFrame::Quic(Frame::DataBlocked(blocked)) => Some(blocked.maximum_data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            data_blocked,
+            vec![4],
+            "DATA_BLOCKED は 1 回だけ送ること: {frames:?}"
+        );
+
+        // 同じ上限で再度ブロックしても通知は増えない
+        assert_eq!(
+            pair.client.write(first, b"ab", false).expect("書き込める"),
+            0,
+            "クレジットは増えないこと"
+        );
+        assert_eq!(
+            pair.client.write(second, b"ab", false).expect("書き込める"),
+            0,
+            "クレジットは増えないこと"
+        );
+        let frames = take_frames(&mut pair.client);
+        assert!(
+            frames.is_empty(),
+            "同じ上限ではブロック通知を送り直さないこと: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn streams_blocked_is_sent_once_per_limit() {
+        // RFC 9000 Section 4.6: ピアの上限に達してストリームを開けない場合は
+        // STREAMS_BLOCKED を送る。同じ上限では繰り返し送らない (Section 12.2)。
+        let mut server_config = config();
+        server_config.initial_max_streams_bidi = 1;
+        server_config.initial_max_streams_uni = 1;
+        let mut pair = Pair::with_config(config(), server_config);
+        pair.handshake();
+
+        assert!(
+            pair.client.open_bidi().is_ok(),
+            "上限まで双方向ストリームを開けること"
+        );
+        assert!(
+            pair.client.open_bidi().is_err(),
+            "上限を超える双方向ストリームは開けないこと"
+        );
+        assert!(
+            pair.client.open_bidi().is_err(),
+            "同じ上限では繰り返し失敗すること"
+        );
+        assert!(
+            pair.client.open_uni().is_ok(),
+            "上限まで単方向ストリームを開けること"
+        );
+        assert!(
+            pair.client.open_uni().is_err(),
+            "上限を超える単方向ストリームは開けないこと"
+        );
+
+        let frames = take_frames(&mut pair.client);
+        let blocked: Vec<(bool, u64)> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                QmuxFrame::Quic(Frame::StreamsBlocked(blocked)) => {
+                    Some((blocked.bidirectional, blocked.maximum_streams))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            blocked,
+            vec![(true, 1), (false, 1)],
+            "方向ごとに 1 回だけ STREAMS_BLOCKED を送ること: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn max_streams_for_uni_notifies_streams_available_once() {
+        // ピアが上限を増やしたことをアプリケーションが観測できること。
+        // 未配送の通知が残っている間は積み増さず、アプリケーションがストリームを
+        // 開いたら改めて通知できること (Section 12.2 の資源消費対策)。
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        let max_streams = |maximum_streams: u64| {
+            encode_frame(&Frame::MaxStreams(frame::max_streams::MaxStreams {
+                bidirectional: false,
+                maximum_streams,
+            }))
+        };
+        inject(&mut pair.client, &max_streams(16));
+        inject(&mut pair.client, &max_streams(32));
+        let events = drain(&mut pair.client);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::StreamsAvailable {
+                        bidirectional: false
+                    }
+                ))
+                .count(),
+            1,
+            "未配送の通知が残っている間は積み増さないこと: {events:?}"
+        );
+
+        // アプリケーションがストリームを開くと、次の上限増加を改めて通知する
+        let _ = pair.client.open_uni().expect("ストリームを開ける");
+        inject(&mut pair.client, &max_streams(48));
+        let events = drain(&mut pair.client);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::StreamsAvailable {
+                    bidirectional: false
+                }
+            )),
+            "ストリームを開いた後は上限増加を通知すること: {events:?}"
+        );
+    }
 }
 
 mod datagrams {
@@ -854,6 +1150,76 @@ mod datagrams {
             pair.server.dropped_datagrams() >= 1,
             "保持量の上限を超えた DATAGRAM の破棄数が観測できること"
         );
+    }
+
+    #[test]
+    fn excess_datagrams_are_counted_exactly() {
+        // 保持量の上限 (64 件) を超えた分だけが破棄されること。既存のテストは
+        // 「1 件以上」しか見ていないため、破棄数の厳密値を固定する。
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        for index in 0..100u32 {
+            pair.client
+                .send_datagram(&index.to_be_bytes())
+                .expect("送信できる");
+        }
+        pair.transfer();
+
+        assert_eq!(
+            pair.server.dropped_datagrams(),
+            36,
+            "保持量の上限を超えた 36 件だけが破棄されること"
+        );
+        let events = drain(&mut pair.server);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Datagram(_)))
+                .count(),
+            64,
+            "上限までの DATAGRAM は配送されること"
+        );
+    }
+
+    #[test]
+    fn datagram_byte_limit_drops_only_the_excess() {
+        // QMux Section 6: バイト数の上限 (1 MiB) を超える DATAGRAM は破棄される。
+        // 1 件 300 KiB の DATAGRAM を 4 件渡すと、3 件 (900 KiB) は届き 4 件目だけが
+        // 破棄される。
+        let mut server_config = config();
+        server_config.max_record_size = 1 << 20;
+        server_config.max_datagram_frame_size = Some(1 << 20);
+        let mut pair = Pair::with_config(config(), server_config);
+        pair.handshake();
+
+        let payload = vec![0xa5u8; 300 * 1024];
+        for _ in 0..4 {
+            let datagram = Frame::Datagram(frame::datagram::Datagram {
+                data: payload.clone(),
+            });
+            // 既定の上限を超える Record のため、上限を上げて組み立てる
+            let mut buf = Vec::new();
+            encode_record(&encode_frame(&datagram), 1 << 20, &mut buf)
+                .expect("テスト用の Record を作れる");
+            pair.server.receive(&buf, NOW);
+        }
+
+        assert_eq!(
+            pair.server.dropped_datagrams(),
+            1,
+            "バイト数の上限を超えた 1 件だけが破棄されること"
+        );
+        let events = drain(&mut pair.server);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Datagram(_)))
+                .count(),
+            3,
+            "上限までの DATAGRAM は配送されること"
+        );
+        assert!(!pair.server.is_closed(), "接続は閉じないこと");
     }
 
     #[test]
@@ -976,6 +1342,100 @@ mod pings {
             TransportErrorCode::PROTOCOL_VIOLATION,
         );
     }
+
+    #[test]
+    fn ping_requests_are_aggregated_into_one_response() {
+        // Section 4.3: 応答前に複数の要求を受信した場合、受信した最大のシーケンス
+        // 番号を持つ 1 件だけを応答してよい (MAY)。要求はすべてアプリケーションへ
+        // 通知する。要求ごとに応答を積むと、要求の連投で送信待ちが増え続ける。
+        let mut server =
+            Connection::new(Role::Server, config()).expect("テスト用の接続を作成できる");
+        let transport_parameters =
+            QmuxFrame::TransportParameters(QxTransportParameters { params: Vec::new() });
+        inject(&mut server, &encode_qmux_frame(&transport_parameters));
+        drain(&mut server);
+
+        // Section 4.3: 要求のシーケンス番号は厳密に増加させる
+        let sequences = [1u64, 3, 7];
+        let mut frames = Vec::new();
+        for sequence in sequences {
+            frames.extend_from_slice(&encode_qmux_frame(&QmuxFrame::Ping(QxPing::Request {
+                sequence: VarInt::new(sequence).expect("可変長整数に収まる"),
+            })));
+        }
+        inject(&mut server, &frames);
+
+        let events = drain(&mut server);
+        let notified: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ping { sequence } => Some(*sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notified, sequences, "要求ごとに通知されること: {events:?}");
+
+        // 送信フレームを分解し、応答が最大シーケンス番号の 1 件だけであることを確認する
+        let responses: Vec<u64> = take_frames(&mut server)
+            .iter()
+            .filter_map(|frame| match frame {
+                QmuxFrame::Ping(QxPing::Response { sequence }) => Some(sequence.as_u64()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            responses,
+            vec![7],
+            "応答は最大のシーケンス番号 1 件に合算されること"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_out_of_order_ping_responses_are_ignored() {
+        // Section 4.3: 応答の到着順は保証されないため、新しい応答だけを通知する。
+        // 同じ応答の再受信と、既に通知した値より小さい応答では通知が増えないこと。
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        let first = pair.client.ping().expect("QX_PING を送れる");
+        let second = pair.client.ping().expect("QX_PING を送れる");
+        assert!(second > first, "シーケンス番号が増えること");
+        // 要求は送らずに捨て、応答を直接注入する
+        let _ = take_frames(&mut pair.client);
+
+        let response = |sequence: u64| {
+            encode_qmux_frame(&QmuxFrame::Ping(QxPing::Response {
+                sequence: VarInt::new(sequence).expect("可変長整数に収まる"),
+            }))
+        };
+
+        inject(&mut pair.client, &response(second));
+        let events = drain(&mut pair.client);
+        let acknowledged: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::PingAcknowledged { sequence } => Some(*sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            acknowledged,
+            vec![second],
+            "新しい応答が通知されること: {events:?}"
+        );
+
+        // 同じ応答の 2 回目と、それより小さい応答では通知が増えない
+        inject(&mut pair.client, &response(second));
+        inject(&mut pair.client, &response(first));
+        let events = drain(&mut pair.client);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::PingAcknowledged { .. })),
+            "重複した応答と降順の応答は通知しないこと: {events:?}"
+        );
+        assert!(!pair.client.is_closed(), "重複した応答で接続を閉じないこと");
+    }
 }
 
 mod termination {
@@ -1025,6 +1485,99 @@ mod termination {
             close_reason(&mut pair.client),
             Some(CloseReason::IdleTimeout),
             "アイドルタイムアウトとして通知されること"
+        );
+    }
+
+    #[test]
+    fn handle_timeout_before_deadline_is_noop() {
+        // RFC 9000 Section 10.1: 期限前のタイマー発火では何もしない
+        let mut pair = Pair::new();
+        pair.handshake();
+        let deadline = pair.client.next_timeout().expect("期限があること");
+
+        pair.client.handle_timeout(NOW);
+        assert!(!pair.client.is_closed(), "期限前は閉じないこと");
+        assert_eq!(
+            pair.client.next_timeout(),
+            Some(deadline),
+            "期限が変わらないこと"
+        );
+        assert!(
+            drain(&mut pair.client).is_empty(),
+            "期限前はイベントを通知しないこと"
+        );
+    }
+
+    #[test]
+    fn next_timeout_is_none_when_idle_timeout_is_disabled() {
+        // RFC 9000 Section 10.1 / Section 18.2: 両端が 0 を広告した場合は
+        // アイドルタイムアウトが無効になり、期限がなくなる
+        let mut disabled = config();
+        disabled.max_idle_timeout = Duration::ZERO;
+        let mut pair = Pair::with_config(disabled.clone(), disabled);
+        pair.handshake();
+
+        assert_eq!(
+            pair.client.next_timeout(),
+            None,
+            "アイドルタイムアウトが無効なら期限がないこと"
+        );
+
+        // 期限がないため、いつタイマーが発火しても接続は閉じない
+        pair.client
+            .handle_timeout(NOW.add(Duration::from_secs(3600)));
+        assert!(!pair.client.is_closed(), "タイマーで閉じないこと");
+    }
+
+    #[test]
+    fn transport_closed_notifies_once_and_rejects_operations() {
+        // Section 7.4: 下位トランスポートが閉じた場合は接続を即座に終了し、
+        // アプリケーションへ 1 回だけ通知する
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        pair.client.transport_closed();
+
+        assert!(pair.client.is_closed(), "閉じた状態になること");
+        let events = drain(&mut pair.client);
+        let closed: Vec<&CloseReason> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ConnectionClosed(reason) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            vec![&CloseReason::TransportClosed],
+            "下位トランスポートの閉塞が 1 回だけ通知されること: {events:?}"
+        );
+
+        // 2 回目の通知ではイベントが増えない
+        pair.client.transport_closed();
+        assert!(drain(&mut pair.client).is_empty(), "2 回目は通知しないこと");
+
+        // 閉塞後は送信もアプリケーションの操作も受け付けない
+        let mut buf = Vec::new();
+        assert!(
+            !pair
+                .client
+                .poll_transmit(&mut buf, NOW)
+                .expect("送信に失敗しない"),
+            "閉塞後は Record を書き出さないこと"
+        );
+        assert!(buf.is_empty(), "書き出したバイト列がないこと");
+        assert!(
+            pair.client.open_bidi().is_err(),
+            "閉塞後はストリームを開けないこと"
+        );
+        assert!(
+            pair.client.send_datagram(b"x").is_err(),
+            "閉塞後は DATAGRAM を送れないこと"
+        );
+        assert!(
+            pair.client.ping().is_err(),
+            "閉塞後は QX_PING を送れないこと"
         );
     }
 
@@ -1466,6 +2019,108 @@ mod bounds {
     }
 
     #[test]
+    fn peer_reset_releases_peer_initiated_uni_stream() {
+        // F-1 の回帰: ピア起動の単方向ストリームをピアが RESET_STREAM で終端した場合も、
+        // アプリケーションがリセットを観測した時点でストリームを破棄し、MAX_STREAMS で
+        // 上限を返却すること (RFC 9000 Section 3.2 / Section 4.6)。破棄後は EOF になる。
+        let mut server_config = config();
+        server_config.initial_max_streams_uni = 1;
+        let mut pair = Pair::with_config(config(), server_config);
+        pair.handshake();
+
+        let id = pair.client.open_uni().expect("単方向ストリームを開ける");
+        pair.client
+            .write(id, b"payload", false)
+            .expect("書き込める");
+        pair.client.reset(id, 0x42).expect("リセットできる");
+        pair.transfer();
+        assert!(
+            drain(&mut pair.server).contains(&Event::StreamReset {
+                id,
+                error_code: 0x42
+            }),
+            "リセットが通知されること"
+        );
+
+        // アプリケーションがリセットを観測するとストリームが破棄される
+        match pair.server.read(id, &mut [0u8; 16]).expect("読み取れる") {
+            ReadResult::Reset { error_code } => {
+                assert_eq!(error_code, 0x42, "エラーコードが一致すること");
+            }
+            other => panic!("リセットを期待したが {other:?} だった"),
+        }
+        match pair.server.read(id, &mut [0u8; 16]).expect("読み取れる") {
+            ReadResult::Data { len, fin } => {
+                assert_eq!(len, 0, "破棄後はデータが読めないこと");
+                assert!(fin, "破棄後は EOF になること");
+            }
+            other => panic!("データを期待したが {other:?} だった"),
+        }
+
+        // 単方向ストリームの上限がピアへ返却される
+        let frames = take_frames(&mut pair.server);
+        let returned = frames.iter().find_map(|frame| match frame {
+            QmuxFrame::Quic(Frame::MaxStreams(max)) if !max.bidirectional => {
+                Some(max.maximum_streams)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            returned,
+            Some(2),
+            "破棄した単方向ストリームの上限が返却されること: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn peer_reset_after_local_finish_releases_bidi_stream() {
+        // F-1 の回帰 (双方向): 自側の送信を終端済みの状態でピアが RESET_STREAM を
+        // 送った場合も、リセットを観測した時点でストリームを破棄し、MAX_STREAMS で
+        // 上限を返却すること (RFC 9000 Section 3.2)。
+        let mut server_config = config();
+        server_config.initial_max_streams_bidi = 1;
+        let mut pair = Pair::with_config(config(), server_config);
+        pair.handshake();
+
+        let id = pair.client.open_bidi().expect("ストリームを開ける");
+        pair.client.write(id, b"abc", false).expect("書き込める");
+        pair.transfer();
+        let (data, _) = read_all(&mut pair.server, id);
+        assert_eq!(data, b"abc", "データが届くこと");
+
+        // 自側の送信を終端してからピアがリセットする
+        assert_eq!(
+            pair.server.write(id, &[], true).expect("FIN を送れる"),
+            0,
+            "FIN だけのフレームはデータを受け付けないこと"
+        );
+        pair.transfer();
+        drain(&mut pair.server);
+        pair.client.reset(id, 9).expect("リセットできる");
+        pair.transfer();
+
+        match pair.server.read(id, &mut [0u8; 16]).expect("読み取れる") {
+            ReadResult::Reset { error_code } => {
+                assert_eq!(error_code, 9, "エラーコードが一致すること");
+            }
+            other => panic!("リセットを期待したが {other:?} だった"),
+        }
+
+        let frames = take_frames(&mut pair.server);
+        let returned = frames.iter().find_map(|frame| match frame {
+            QmuxFrame::Quic(Frame::MaxStreams(max)) if max.bidirectional => {
+                Some(max.maximum_streams)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            returned,
+            Some(2),
+            "破棄した双方向ストリームの上限が返却されること: {frames:?}"
+        );
+    }
+
+    #[test]
     fn frames_for_removed_stream_are_discarded() {
         // 終端して破棄したストリームへのフレームで接続を閉じないこと
         let mut pair = Pair::new();
@@ -1482,6 +2137,9 @@ mod bounds {
         pair.server.write(id, &[], true).expect("FIN を返せる");
         assert!(!pair.server.is_closed(), "接続は閉じないこと");
 
+        // 破棄するまでに溜まったイベントを捨て、以降の増分だけを確認する
+        drain(&mut pair.server);
+
         // 破棄したストリームへのフレームを直接受け取らせてもエラーにしない
         let duplicate = Frame::Stream(frame::stream::Stream {
             stream_id: id.as_u64(),
@@ -1494,6 +2152,19 @@ mod bounds {
             !pair.server.is_closed(),
             "破棄したストリームへのフレームで接続を閉じないこと"
         );
+
+        // 破棄後にイベントは増えず、ストリームが再作成されることもない
+        assert!(
+            drain(&mut pair.server).is_empty(),
+            "破棄したストリームへのフレームでイベントが増えないこと"
+        );
+        match pair.server.read(id, &mut [0u8; 8]).expect("読み取れる") {
+            ReadResult::Data { len, fin } => {
+                assert_eq!(len, 0, "再作成されたデータは読めないこと");
+                assert!(fin, "終端したままであること");
+            }
+            other => panic!("データを期待したが {other:?} だった"),
+        }
     }
 
     #[test]

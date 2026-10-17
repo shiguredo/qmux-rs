@@ -40,6 +40,8 @@ QUIC version 1 のストリーム操作とデータグラム操作を提供す�
 
 ## 構成
 
+リポジトリ全体のクレート構成は次のとおりです。他のドキュメントはこの表を参照します。
+
 | クレート | 役割 |
 | --- | --- |
 | `shiguredo_qmux` | Sans I/O & no_std + alloc の QMux 実装 |
@@ -48,6 +50,8 @@ QUIC version 1 のストリーム操作とデータグラム操作を提供す�
 | `crates/dwnx-rs` | `dwnx_conn` の安全な Sans I/O ラッパー |
 | `crates/tokio-dwnx` | `dwnx-rs` の tokio 非同期ラッパー |
 | `interop` | 2 実装を接続する相互接続テスト |
+| `pbt` | Sans I/O 実装の性質テスト (noprop) |
+| `fuzz` | 受信経路とデコーダの Fuzzing (cargo-fuzz)。nightly で独立にビルドするためワークスペースからは除外している |
 
 ## 使い方
 
@@ -61,8 +65,8 @@ use shiguredo_qmux::connection::Connection;
 use shiguredo_qmux::event::Event;
 
 let now = Timestamp::from_micros(0);
-let mut client = Connection::new(Role::Client, Config::default());
-let mut server = Connection::new(Role::Server, Config::default());
+let mut client = Connection::new(Role::Client, Config::default()).expect("テスト用の接続を作成できる");
+let mut server = Connection::new(Role::Server, Config::default()).expect("テスト用の接続を作成できる");
 let mut buf = Vec::new();
 
 // 最初の Record (QX_TRANSPORT_PARAMETERS) を送り、相手に処理させる
@@ -81,13 +85,26 @@ use shiguredo_qmux::config::Config;
 use tokio_qmux::Connection;
 
 # async fn example() -> Result<(), tokio_qmux::Error> {
+// Config::default() はフロー制御のクレジットが 0 でデータを送れないため、明示的に設定する
+let config = Config {
+    initial_max_data: 64 * 1024,
+    initial_max_stream_data_bidi_local: 16 * 1024,
+    initial_max_stream_data_bidi_remote: 16 * 1024,
+    initial_max_stream_data_uni: 16 * 1024,
+    initial_max_streams_bidi: 8,
+    initial_max_streams_uni: 8,
+    ..Config::default()
+};
 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-let client = Connection::new(Role::Client, client_io, Config::default())?;
-let server = Connection::new(Role::Server, server_io, Config::default())?;
+let client = Connection::new(Role::Client, client_io, config.clone())?;
+let server = Connection::new(Role::Server, server_io, config)?;
 # let _ = (client, server);
 # Ok(())
 # }
 ```
+
+`Config::default()` はアイドルタイムアウト無効、フロー制御のクレジット 0、DATAGRAM 無効です。
+ストリームや DATAGRAM を使う場合は、上記のように必要な値を明示的に設定します。
 
 下位トランスポートには接続済みの双方向バイトストリームを渡します。TLS と ALPN の
 ネゴシエーションは呼び出し側の責務です。実行可能な最小例は

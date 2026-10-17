@@ -30,16 +30,20 @@
 //!
 //! # エラーの扱い
 //!
-//! ピアの入力から検出したプロトコル違反は、[`Connection::receive`] がエラーを
+//! ピアの入力から検出したプロトコル違反は、
+//! [`Connection::receive`](crate::connection::Connection::receive) がエラーを
 //! 返すのではなく、CONNECTION_CLOSE フレームを送信待ちに追加して
-//! [`Event::ConnectionClosed`] を通知する。アプリケーションの誤用
-//! (未作成のストリームへの書き込みなど) と、終端したストリームへの操作は、
-//! 接続を閉じずに [`crate::codec::error::Error`] として返す。
+//! [`Event::ConnectionClosed`](crate::event::Event::ConnectionClosed) を通知する。
+//! アプリケーションの誤用 (未作成のストリームへの書き込みなど) と、終端した
+//! ストリームへの操作は、接続を閉じずに [`crate::codec::error::Error`] として返す。
 //!
 //! # 使い方
 //!
-//! [`Connection`] に受信バイト列を渡し、[`Connection::poll_event`] でイベントを
-//! 取り出し、[`Connection::poll_transmit`] で送信バイト列を書き出す。
+//! [`Connection`](crate::connection::Connection) に受信バイト列を渡し、
+//! [`Connection::poll_event`](crate::connection::Connection::poll_event) で
+//! イベントを取り出し、
+//! [`Connection::poll_transmit`](crate::connection::Connection::poll_transmit) で
+//! 送信バイト列を書き出す。
 //! 下位トランスポートへの読み書きと時刻の供給はアプリケーションが行う。
 //!
 //! ```

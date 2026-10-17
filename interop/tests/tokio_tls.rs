@@ -2,6 +2,8 @@
 //!
 //! TCP + TLS (rustls + aws-lc-sys) + ALPN で接続し、クライアントから
 //! 双方向ストリームでデータを送り、サーバーがエコーを返すことを検証する。
+//! 証明書は rcgen で生成したテスト用の CA と `localhost` のサーバー証明書を使い、
+//! クライアントは CA を信頼して標準の検証器でサーバー証明書を検証する。
 
 use std::sync::Arc;
 
@@ -51,69 +53,92 @@ fn dwnx_config() -> DwnxTransportParameters {
     }
 }
 
-/// ALPN を設定したサーバー設定を作る
-fn server_config() -> Arc<rustls::ServerConfig> {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("自己署名証明書を作れる");
-    let cert = certified.cert.der().clone();
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+/// テスト用の証明書 (CA とサーバー証明書)
+struct TestCertificates {
+    /// サーバー証明書のチェーン
+    cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// サーバー証明書の秘密鍵 (PKCS#8)
+    key: rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+    /// クライアントが信頼する CA 証明書
+    ca_cert: rustls::pki_types::CertificateDer<'static>,
+}
 
+/// テスト用の CA と `localhost` のサーバー証明書を生成する
+///
+/// rcgen で CA (`IsCa::Ca`) を作り、その CA でサーバー証明書に署名する。クライアントは
+/// CA 証明書を `rustls::RootCertStore` に入れ、標準の検証器でサーバー証明書を検証する
+/// (検証を無効化する検証器は使わない)。
+fn generate_certificates() -> TestCertificates {
+    // CA 証明書。SAN は持たせず、証明書署名のための鍵用途だけを与える
+    let mut ca_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("CA のパラメータを作成できる");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "qmux-rs interop test CA");
+    let ca_key = rcgen::KeyPair::generate().expect("CA の鍵を生成できる");
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("CA 証明書を作成できる");
+
+    // サーバー証明書。SAN はテストで接続する `localhost` にする
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("サーバーのパラメータを作成できる");
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    server_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    // CA で署名した証明書であることを示す Authority Key Identifier を付ける
+    server_params.use_authority_key_identifier_extension = true;
+    let server_key = rcgen::KeyPair::generate().expect("サーバーの鍵を生成できる");
+    let server_cert = server_params
+        .signed_by(&server_key, &ca)
+        .expect("CA でサーバー証明書に署名できる");
+
+    TestCertificates {
+        cert_chain: vec![server_cert.der().clone()],
+        key: rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+        ca_cert: ca.der().clone(),
+    }
+}
+
+/// ALPN を設定したサーバー設定を作る
+fn server_config(certificates: &TestCertificates) -> Arc<rustls::ServerConfig> {
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key.into())
+        .with_single_cert(
+            certificates.cert_chain.clone(),
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certificates.key.clone_key()),
+        )
         .expect("証明書を設定できる");
     config.alpn_protocols = vec![ALPN.to_vec()];
     Arc::new(config)
 }
 
-/// 証明書を検証しないクライアント設定を作る (テスト専用)
-fn client_config() -> Arc<rustls::ClientConfig> {
+/// CA を信頼するクライアント設定を作る
+fn client_config(ca_cert: rustls::pki_types::CertificateDer<'static>) -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_cert).expect("CA 証明書を追加できる");
     let mut config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = vec![ALPN.to_vec()];
     Arc::new(config)
 }
 
-/// 検証対象の証明書を無条件に受け入れる検証器 (テスト専用)
-#[derive(Debug)]
-struct NoVerify;
+/// テストの待ち時間の上限
+///
+/// 実装の退行でテストがハングしないよう、すべての待ちに上限を設ける。
+const GUARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+/// guard timeout 付きで future を待つ
+async fn with_guard<T>(future: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(GUARD_TIMEOUT, future).await {
+        Ok(value) => value,
+        Err(_) => panic!("guard timeout ({GUARD_TIMEOUT:?}) を超えた"),
     }
 }
 
@@ -148,16 +173,20 @@ async fn qmux_client_dwnx_server_over_tls() {
     // aws-lc-sys をプロバイダとして使う
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let listener = TcpListener::bind("127.0.0.1:0")
+    // テスト用の CA と `localhost` のサーバー証明書を生成する
+    let certificates = generate_certificates();
+    let tls_server_config = server_config(&certificates);
+    let tls_client_config = client_config(certificates.ca_cert.clone());
+
+    let listener = with_guard(TcpListener::bind("127.0.0.1:0"))
         .await
         .expect("listen できる");
     let addr = listener.local_addr().expect("addr を取得できる");
 
     let server = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.expect("accept できる");
-        let acceptor = TlsAcceptor::from(server_config());
-        let tls = acceptor
-            .accept(tcp)
+        let (tcp, _) = with_guard(listener.accept()).await.expect("accept できる");
+        let acceptor = TlsAcceptor::from(tls_server_config);
+        let tls = with_guard(acceptor.accept(tcp))
             .await
             .expect("TLS ハンドシェイクできる");
         assert_eq!(
@@ -166,27 +195,28 @@ async fn qmux_client_dwnx_server_over_tls() {
             "ALPN がネゴシエートされること"
         );
 
-        let mut connection = tokio_dwnx::Connection::new(DwnxRole::Server, tls, &dwnx_config());
-        let (mut send, mut recv) = connection
-            .accept_bidirectional()
+        let connection = tokio_dwnx::Connection::new(DwnxRole::Server, tls, dwnx_config())
+            .expect("QMux 接続を作成できる");
+        let (mut send, mut recv) = with_guard(connection.accept_bidirectional())
             .await
-            .expect("accept に失敗しない")
             .expect("ストリームが届く");
 
-        let data = read_all_dwnx(&mut recv).await;
+        let data = with_guard(read_all_dwnx(&mut recv)).await;
         assert_eq!(data, b"hello from qmux", "受信データが一致すること");
 
         // エコーを返す
-        send.write(&data).await.expect("書き込める");
-        send.finish().await.expect("FIN を送れる");
+        let written = with_guard(send.write(&data)).await.expect("書き込める");
+        assert_eq!(written, data.len(), "全データを受け付けること");
+        with_guard(send.finish()).await.expect("FIN を送れる");
     });
 
-    let tcp = TcpStream::connect(addr).await.expect("接続できる");
-    let connector = TlsConnector::from(client_config());
+    let tcp = with_guard(TcpStream::connect(addr))
+        .await
+        .expect("接続できる");
+    let connector = TlsConnector::from(tls_client_config);
     let server_name =
         rustls::pki_types::ServerName::try_from("localhost").expect("名前を変換できる");
-    let tls = connector
-        .connect(server_name, tcp)
+    let tls = with_guard(connector.connect(server_name, tcp))
         .await
         .expect("TLS ハンドシェイクできる");
     assert_eq!(
@@ -197,15 +227,16 @@ async fn qmux_client_dwnx_server_over_tls() {
 
     let connection =
         QmuxConnection::new(QmuxRole::Client, tls, qmux_config()).expect("QMux 接続を作成できる");
-    let (mut send, mut recv) = connection
-        .open_bidirectional()
+    let (mut send, mut recv) = with_guard(connection.open_bidirectional())
         .await
         .expect("ストリームを開ける");
-    send.write(b"hello from qmux").await.expect("書き込める");
-    send.finish().await.expect("FIN を送れる");
+    with_guard(send.write(b"hello from qmux"))
+        .await
+        .expect("書き込める");
+    with_guard(send.finish()).await.expect("FIN を送れる");
 
-    let echoed = read_all_qmux(&mut recv).await;
+    let echoed = with_guard(read_all_qmux(&mut recv)).await;
     assert_eq!(echoed, b"hello from qmux", "エコーが一致すること");
 
-    server.await.expect("サーバータスクが終了する");
+    with_guard(server).await.expect("サーバータスクが終了する");
 }

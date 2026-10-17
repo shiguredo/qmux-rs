@@ -78,7 +78,13 @@ impl ConnectionClose {
         VarInt::try_from(self.error_code)
             .expect("value fits in a variable-length integer")
             .encode_to_vec(buf);
-        if let Some(frame_type) = self.frame_type {
+        // RFC 9000 Section 19.19: Frame Type フィールドは 0x1c (トランスポート
+        // エラー) のみが持つ。0x1d (アプリケーションエラー) では送ってはならない。
+        // フィールドの有無は self.application ではなくフレームタイプで決まるため、
+        // frame_type が Some でも application が true のときは出力しない。
+        if !self.application
+            && let Some(frame_type) = self.frame_type
+        {
             VarInt::try_from(frame_type)
                 .expect("value fits in a variable-length integer")
                 .encode_to_vec(buf);

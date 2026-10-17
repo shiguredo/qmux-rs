@@ -15,13 +15,14 @@ use crate::codec::varint::VarInt;
 pub mod frame_type {
     /// QX_TRANSPORT_PARAMETERS フレーム (Section 4.2)
     ///
-    /// 値はドラフトの暫定コードポイントであり、RFC 化の際に変更される可能性がある。
+    /// 値はドラフトが IANA に provisional として登録を要求しているコードポイントで
+    /// (Section 13.1)、RFC 化の際に恒久的な値へ置き換えられる可能性がある。
     ///
     /// 8 バイトの可変長整数でエンコードした先頭バイトが 0xff になるよう選ばれた
     /// マジックナンバーで、HTTP/1.1 / HTTP/2 との判別に使う。ドラフト本文はこの値の
     /// ワイヤ表現を `"\xffQMX\r\n\r\n"` と記載しているが、8 バイトの可変長整数として
     /// エンコードした実際のバイト列は ff 51 53 30 0d 0a 0d 0a になる。本実装は
-    /// IANA 登録値であるこの定数に従う。
+    /// ドラフトのフレーム定義と IANA の表 (Section 13.1) が示すこの値に従う。
     pub const QX_TRANSPORT_PARAMETERS: u64 = 0x3f5153300d0a0d0a;
     /// QX_PING の要求 (Section 4.3)
     ///

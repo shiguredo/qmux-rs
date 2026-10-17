@@ -28,13 +28,6 @@ impl Timestamp {
         Self(self.0.saturating_add(duration.0))
     }
 
-    /// 2 つのタイムスタンプの差を Duration として返す
-    ///
-    /// self が other より前の場合は Duration(0) を返す
-    pub const fn saturating_duration_since(self, other: Self) -> Duration {
-        Duration(self.0.saturating_sub(other.0))
-    }
-
     /// other 以降かどうかを返す
     pub const fn has_elapsed(self, other: Self) -> bool {
         self.0 >= other.0
@@ -71,39 +64,5 @@ impl Duration {
     /// ミリ秒値を返す (端数切り捨て)
     pub const fn as_millis(self) -> u64 {
         self.0 / 1000
-    }
-
-    /// 飽和加算
-    pub const fn saturating_add(self, other: Self) -> Self {
-        Self(self.0.saturating_add(other.0))
-    }
-
-    /// 飽和減算
-    pub const fn saturating_sub(self, other: Self) -> Self {
-        Self(self.0.saturating_sub(other.0))
-    }
-}
-
-impl core::ops::Add<Duration> for Timestamp {
-    type Output = Timestamp;
-
-    fn add(self, rhs: Duration) -> Timestamp {
-        self.add(rhs)
-    }
-}
-
-impl core::ops::Add for Duration {
-    type Output = Duration;
-
-    fn add(self, rhs: Duration) -> Duration {
-        Self(self.0.saturating_add(rhs.0))
-    }
-}
-
-impl core::ops::Sub for Timestamp {
-    type Output = Duration;
-
-    fn sub(self, rhs: Timestamp) -> Duration {
-        self.saturating_duration_since(rhs)
     }
 }

@@ -48,31 +48,8 @@ pub enum Event {
         /// アプリケーションエラーコード
         error_code: u64,
     },
-    /// ストリームの送信上限が増えた
-    MaxStreamData {
-        /// ストリーム ID
-        id: i64,
-        /// 累積の送信上限
-        max_data: u64,
-    },
-    /// ストリーム数の上限が増えた
-    MaxStreams {
-        /// 双方向ストリームかどうか
-        bidirectional: bool,
-        /// ローカル起動のストリーム数の上限かどうか
-        local: bool,
-        /// 累積のストリーム数上限
-        max_streams: u64,
-    },
-    /// ストリームデータを送信した
-    StreamDataWritten {
-        /// ストリーム ID
-        id: i64,
-        /// 開始オフセット
-        offset: u64,
-        /// 送信した長さ
-        len: usize,
-    },
     /// 接続が閉じた
+    ///
+    /// アイドルタイムアウトの満了、または下位トランスポートの終了で発生する。
     ConnectionClosed,
 }

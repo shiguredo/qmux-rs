@@ -16,12 +16,11 @@ pub(crate) enum StreamEvent {
     Reset(u64),
 }
 
-/// ドライバからストリームの送信側へ配送するイベント
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SendEvent {
-    /// ピアが送信停止を要求した (STOP_SENDING)
-    StopSending(u64),
-}
+/// ドライバからストリームの送信側へ配送する通知の型
+///
+/// 通知は 1 種類 (ピアの STOP_SENDING のアプリケーションエラーコード) だけなので、
+/// 専用の enum は設けず型別名で表す。
+pub(crate) type SendEvent = u64;
 
 /// ピアが要求した送信停止の通知 (STOP_SENDING)
 ///
@@ -75,11 +74,12 @@ impl SendStream {
     /// フロー制御による送信量の調整はドライバが行う。ドライバがデータをすべて
     /// 受け付け、保留分も送り終えるまで待つ。戻り値は受け付けたバイト数で、渡した
     /// データの長さと等しい。ピアが送信停止を要求している場合は
-    /// [`Error::Stopped`] を返す。
+    /// [`Error::Stopped`] を返し、FIN 送信済みなどで送信側が終端している場合は
+    /// [`Error::StreamFinished`] を返す。
     pub async fn write(&mut self, data: &[u8]) -> Result<usize> {
         self.check_stopped()?;
         if self.finished {
-            return Err(Error::DriverStopped);
+            return Err(Error::StreamFinished);
         }
         let (ack, receive) = oneshot::channel();
         self.commands
@@ -164,7 +164,7 @@ impl SendStream {
             return Ok(error_code);
         }
         match self.events.recv().await {
-            Some(SendEvent::StopSending(error_code)) => {
+            Some(error_code) => {
                 self.stop_sending = Some(error_code);
                 Ok(error_code)
             }
@@ -182,7 +182,7 @@ impl SendStream {
         if let Some(error_code) = self.stop_sending {
             return Err(Error::Stopped(error_code));
         }
-        if let Ok(SendEvent::StopSending(error_code)) = self.events.try_recv() {
+        if let Ok(error_code) = self.events.try_recv() {
             self.stop_sending = Some(error_code);
             return Err(Error::Stopped(error_code));
         }
@@ -191,6 +191,10 @@ impl SendStream {
 }
 
 /// ストリームの受信側
+///
+/// このハンドルをドロップすると、ドライバはピアへ送信停止 (STOP_SENDING) を要求し、
+/// 以後そのストリームを読まない (RFC 9000 Section 3.5)。終端 (FIN または
+/// RESET_STREAM) を配送済みのストリームでは通知しない。
 #[derive(Debug)]
 pub struct RecvStream {
     /// ストリーム ID
@@ -269,13 +273,32 @@ impl RecvStream {
     }
 
     /// ストリームの受信側に送信停止を要求する (STOP_SENDING を送る)
+    ///
+    /// 接続が閉じている場合は [`Error::ConnectionClosed`] を返す。
     pub async fn stop_sending(&mut self, error_code: u64) -> Result<()> {
+        let (ack, receive) = oneshot::channel();
         self.commands
             .send(Command::StopSending {
                 id: self.id,
                 error_code,
+                ack,
             })
             .await
-            .map_err(|_| Error::ConnectionClosed)
+            .map_err(|_| Error::ConnectionClosed)?;
+        receive.await.map_err(|_| Error::ConnectionClosed)?
+    }
+}
+
+impl Drop for RecvStream {
+    /// 受信側を破棄したことをドライバへ通知する
+    ///
+    /// ピアが送り続けるデータを受け取らないため、ドライバは STOP_SENDING を送って
+    /// ピアの送信側を終端させる (RFC 9000 Section 3.5)。ドライバのコマンドチャネルが
+    /// 満杯の場合は通知を諦めるが、その場合もデータの配送時に受信側の消失を検知して
+    /// 同じ処理が行われる。
+    fn drop(&mut self) {
+        let _ = self
+            .commands
+            .try_send(Command::DropRecvStream { id: self.id });
     }
 }

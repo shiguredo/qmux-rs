@@ -58,6 +58,8 @@ jobs:
       contents: read
     steps:
       - name: Slack Notification
+        # 時雨堂の社内 action であり、社内の修正を全リポジトリへ即時反映させるため、
+        # 他 action と異なり可変 ref の @main を意図的に使う
         uses: shiguredo/github-actions/.github/actions/slack-notify@main
         with:
           status: ${{ job.status }}

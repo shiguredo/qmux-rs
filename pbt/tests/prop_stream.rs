@@ -1,20 +1,27 @@
-//! QMux のフロー制御のプロパティベーステスト
+//! QMux ストリームのプロパティベーステスト
 //!
-//! 接続レベルとストリームレベルのクレジットを小さくしたときに、送信側が
-//! 一部だけを受け付けて残りを再送する経路を通っても、データが欠けずに
-//! FIN まで届くことを検証する (RFC 9000 Section 4.1)。
+//! ストリーム ID の表現 (RFC 9000 Section 2.1) と、接続レベル・ストリームレベルの
+//! フロー制御 (RFC 9000 Section 4.1) を検証する。クレジットを小さくしたときに、
+//! 送信側が一部だけを受け付けて残りを再送する経路を通っても、データが欠けずに
+//! FIN まで届くことを確認する。
 //!
-//! Sans I/O のため、下位トランスポートの代わりに 2 つの [`Connection`] 間で
-//! バイト列を受け渡す。
+//! フロー制御は Sans I/O のため、下位トランスポートの代わりに 2 つの
+//! [`Connection`] 間でバイト列を受け渡す。
 
 use pbt::common::sample_nonempty_bytes;
 use pbt::common::test_runner;
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::Timestamp;
+use shiguredo_qmux::codec::varint;
 use shiguredo_qmux::config::Config;
 use shiguredo_qmux::connection::Connection;
 use shiguredo_qmux::event::Event;
-use shiguredo_qmux::stream::ReadResult;
+use shiguredo_qmux::stream::{ReadResult, StreamId, StreamType};
+
+/// 4 * sequence + 種別が可変長整数で表現できる最大のシーケンス番号
+///
+/// 種別は 0..=3 なので、`varint::MAX_VALUE / 4` が上限になる。
+const MAX_SEQUENCE: u64 = varint::MAX_VALUE / 4;
 
 /// ペイロード長の上限
 const MAX_PAYLOAD_LEN: usize = 1024;
@@ -198,5 +205,72 @@ fn flow_control_preserves_stream_data() -> noprop::TestResult {
         );
         Ok(())
     })?;
+    Ok(())
+}
+
+/// ストリーム ID のシーケンス番号を生成する
+///
+/// 0 と 1、表現できる上限とその 1 つ手前は一様分布では出にくいため境界値として
+/// 混ぜる。上限 (`MAX_SEQUENCE`) は種別 3 でも可変長整数に収まる最大値である。
+fn sample_sequence(ctx: &mut noprop::TestCaseContext) -> u64 {
+    noprop::sample_with_boundaries(
+        ctx,
+        &[0u64, 1, MAX_SEQUENCE - 1, MAX_SEQUENCE],
+        noprop::Ratio::one_nth(4),
+        |ctx| noprop::sample_u64_in(ctx, 0..=MAX_SEQUENCE),
+    )
+}
+
+/// 4 種類のストリーム種別を等確率で生成する
+fn sample_stream_type(ctx: &mut noprop::TestCaseContext) -> StreamType {
+    match noprop::sample_usize_in(ctx, 0..4) {
+        0 => StreamType::ClientBidi,
+        1 => StreamType::ServerBidi,
+        2 => StreamType::ClientUni,
+        _ => StreamType::ServerUni,
+    }
+}
+
+/// `from_parts` で組み立てたストリーム ID が種別とシーケンス番号に戻る
+///
+/// RFC 9000 Section 2.1: ストリーム ID は `4 * sequence + 種別` で表現される。
+/// 境界値 (0、1、上限付近) と 4 種別すべてを生成し、`sequence()` / `stream_type()`
+/// のラウンドトリップと、上限を超えるシーケンス番号の拒否を検証する。
+#[test]
+fn stream_id_parts_roundtrip() -> noprop::TestResult {
+    let seen_types = std::cell::Cell::new(0u32);
+    let mut runner = test_runner()?;
+    runner.run(512, |ctx| {
+        let stream_type = sample_stream_type(ctx);
+        let sequence = sample_sequence(ctx);
+
+        let id = StreamId::from_parts(stream_type, sequence)
+            .expect("上限内のシーケンス番号なのでストリーム ID を作れる");
+        assert_eq!(id.sequence(), sequence, "シーケンス番号が一致しない");
+        assert_eq!(id.stream_type(), stream_type, "ストリーム種別が一致しない");
+        assert_eq!(
+            id.as_u64(),
+            4 * sequence + stream_type as u64,
+            "ストリーム ID が 4 * sequence + 種別 にならない"
+        );
+
+        // 上限の 1 つ先は可変長整数で表現できないため拒否される
+        assert!(
+            StreamId::from_parts(stream_type, MAX_SEQUENCE + 1).is_none(),
+            "表現できないシーケンス番号は拒否される: sequence={}",
+            MAX_SEQUENCE + 1
+        );
+
+        // assert 通過後に種別を記録する
+        seen_types.set(seen_types.get() | (1u32 << stream_type as usize));
+        Ok(())
+    })?;
+
+    assert_eq!(
+        seen_types.get(),
+        0b1111,
+        "4 種別すべてが生成されなかった: seen={:#x}\n{runner}",
+        seen_types.get()
+    );
     Ok(())
 }

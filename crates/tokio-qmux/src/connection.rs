@@ -45,13 +45,33 @@ pub(crate) enum Command {
         ack: oneshot::Sender<Result<()>>,
     },
     /// ストリームの受信側に送信停止を要求する
-    StopSending { id: StreamId, error_code: u64 },
+    StopSending {
+        id: StreamId,
+        error_code: u64,
+        ack: oneshot::Sender<Result<()>>,
+    },
     /// DATAGRAM を送信する
-    Datagram(Vec<u8>),
+    Datagram {
+        data: Vec<u8>,
+        ack: oneshot::Sender<Result<()>>,
+    },
     /// QX_PING を送信する
     Ping(oneshot::Sender<Result<u64>>),
     /// ストリームの読み取り容量が空いたことをドライバへ通知する
     PollReadable { id: StreamId },
+    /// アプリケーションがストリームの受信側を破棄した
+    ///
+    /// [`RecvStream`] の drop から送られる。ピアへ送信停止 (STOP_SENDING) を要求し、
+    /// 以後このストリームを読まないようにする (RFC 9000 Section 3.5)。
+    DropRecvStream { id: StreamId },
+    /// 保留している配送の再試行を促す
+    ///
+    /// `accept_bidirectional` / `accept_unidirectional` / `recv_stop_sending` /
+    /// `recv_ping_ack` が 1 件受け取った時点で送られる。これらのメソッドは受信
+    /// チャネルを待つだけでドライバを起こさないため、受け渡し待ちのキュー
+    /// (`pending_accept` / `pending_stop_sending` / `pending_ping_acks`) に残った分を
+    /// 配送するきっかけが要る。
+    Wake,
 }
 
 impl Command {
@@ -62,7 +82,7 @@ impl Command {
     fn requires_establishment(&self) -> bool {
         matches!(
             self,
-            Self::OpenBidirectional(_) | Self::OpenUnidirectional(_) | Self::Datagram(_)
+            Self::OpenBidirectional(_) | Self::OpenUnidirectional(_) | Self::Datagram { .. }
         )
     }
 }
@@ -98,8 +118,9 @@ pub const DEFAULT_LINGER: Duration = Duration::from_secs(3);
 /// QMux 接続
 ///
 /// 下位トランスポートを所有するドライバタスクを起動する。[`Connection`] を
-/// ドロップするとコマンドチャネルが閉じ、ドライバは下位トランスポートを閉じて
-/// 終了する。
+/// ドロップすると close 要求チャネルの送信側が閉じ、ドライバは下位トランスポートを
+/// 閉じて終了する (linger は待たない)。ストリームのハンドルが残っていても、ドライバ
+/// 自身がコマンド送信側を保持するため、コマンドチャネルは閉じない。
 #[derive(Debug)]
 pub struct Connection {
     /// ドライバへのコマンド送信
@@ -124,6 +145,10 @@ pub struct Connection {
     ///
     /// `accept_bidirectional` と同じ理由で Mutex で包む。
     stop_sending: Mutex<mpsc::Receiver<StopSendingObserved>>,
+    /// QX_PING の応答 (シーケンス番号) の受け取り
+    ///
+    /// `accept_bidirectional` と同じ理由で Mutex で包む。
+    ping_acks: Mutex<mpsc::Receiver<u64>>,
     /// ピアのトランスポートパラメータの最新値
     ///
     /// ドライバが受信時に watch で配る。`&self` でいつでも同期取得できる。
@@ -185,6 +210,7 @@ impl Connection {
         let (accept_unidirectional_tx, accept_unidirectional_rx) = mpsc::channel(ACCEPT_CAPACITY);
         let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_CAPACITY);
         let (stop_sending_tx, stop_sending_rx) = mpsc::channel(STOP_SENDING_CAPACITY);
+        let (ping_ack_tx, ping_ack_rx) = mpsc::channel(STOP_SENDING_CAPACITY);
         let (closed_tx, closed_rx) = watch::channel(None);
         let (peer_params_tx, peer_params_rx) = watch::channel(None);
         let (dropped_datagrams_tx, dropped_datagrams_rx) = watch::channel(0);
@@ -195,8 +221,8 @@ impl Connection {
         let (reader, writer) = tokio::io::split(io);
         let driver = Driver {
             connection,
-            reader: Box::new(reader),
-            writer: Box::new(writer),
+            reader,
+            writer,
             command_rx,
             command_tx: commands.clone(),
             close_request_rx,
@@ -204,6 +230,7 @@ impl Connection {
             accept_unidirectional_tx,
             datagram_tx,
             stop_sending_tx,
+            ping_ack_tx,
             peer_params_tx,
             dropped_datagrams_tx,
             closed_tx,
@@ -213,6 +240,11 @@ impl Connection {
             pending_readable: BTreeSet::new(),
             pending_commands: VecDeque::new(),
             pending_stop_sending: VecDeque::new(),
+            pending_ping_acks: VecDeque::new(),
+            pending_stream_events: VecDeque::new(),
+            pending_accept: VecDeque::new(),
+            output: Vec::new(),
+            written: 0,
             datagram_drops: 0,
             established: false,
             linger,
@@ -220,7 +252,7 @@ impl Connection {
             write_shutdown: false,
             linger_expired: false,
             read_scratch: vec![0u8; READ_BUFFER_SIZE],
-            started: std::time::Instant::now(),
+            started: Instant::now(),
             close_reason: None,
             transport_ended: false,
         };
@@ -233,6 +265,7 @@ impl Connection {
             accept_unidirectional: Mutex::new(accept_unidirectional_rx),
             datagrams: Mutex::new(datagram_rx),
             stop_sending: Mutex::new(stop_sending_rx),
+            ping_acks: Mutex::new(ping_ack_rx),
             peer_params: peer_params_rx,
             dropped_datagrams: dropped_datagrams_rx,
             closed: closed_rx,
@@ -269,7 +302,11 @@ impl Connection {
     /// このメソッドは cancel safe である。待っている間に future を破棄しても、
     /// まだ受け取っていないストリームは失われない。`select!` の腕に置いてよい。
     pub async fn accept_bidirectional(&self) -> Result<Option<(SendStream, RecvStream)>> {
-        Ok(self.accept_bidirectional.lock().await.recv().await)
+        let accepted = self.accept_bidirectional.lock().await.recv().await;
+        if accepted.is_some() {
+            self.wake_driver();
+        }
+        Ok(accepted)
     }
 
     /// ピア起動の単方向ストリームを受け取る
@@ -282,15 +319,39 @@ impl Connection {
     /// このメソッドは cancel safe である。まだ受け取っていないストリームは、
     /// 待っている間に future を破棄しても失われない。
     pub async fn accept_unidirectional(&self) -> Result<Option<RecvStream>> {
-        Ok(self.accept_unidirectional.lock().await.recv().await)
+        let accepted = self.accept_unidirectional.lock().await.recv().await;
+        if accepted.is_some() {
+            self.wake_driver();
+        }
+        Ok(accepted)
+    }
+
+    /// 保留している配送の再試行をドライバへ促す
+    ///
+    /// コマンドチャネルが満杯の場合は通知を諦める。満杯とは未処理のコマンドが
+    /// 溜まっている状態であり、それらを 1 つずつ処理する各ループで配送の再試行も
+    /// 行われるためである。
+    fn wake_driver(&self) {
+        let _ = self.commands.try_send(Command::Wake);
     }
 
     /// DATAGRAM を送信する
+    ///
+    /// ピアが DATAGRAM 拡張を広告していない場合や、フレームがピアの
+    /// `max_datagram_frame_size` / `max_record_size` を超える場合は
+    /// [`Error::Qmux`] を返す (RFC 9221 Section 3、draft-ietf-quic-qmux-02
+    /// Section 9.1)。DATAGRAM は信頼的に配送されるが、アプリケーションが速やかに
+    /// 受け取れない場合は受信側で破棄されうる。
     pub async fn send_datagram(&self, data: &[u8]) -> Result<()> {
+        let (ack, receive) = oneshot::channel();
         self.commands
-            .send(Command::Datagram(data.to_vec()))
+            .send(Command::Datagram {
+                data: data.to_vec(),
+                ack,
+            })
             .await
-            .map_err(|_| Error::ConnectionClosed)
+            .map_err(|_| Error::ConnectionClosed)?;
+        receive.await.map_err(|_| Error::ConnectionClosed)?
     }
 
     /// DATAGRAM を受信する
@@ -343,7 +404,11 @@ impl Connection {
     /// このメソッドは cancel safe である。待っている間に future を破棄しても、
     /// まだ受け取っていない通知は失われない。
     pub async fn recv_stop_sending(&self) -> Result<Option<StopSendingObserved>> {
-        Ok(self.stop_sending.lock().await.recv().await)
+        let observed = self.stop_sending.lock().await.recv().await;
+        if observed.is_some() {
+            self.wake_driver();
+        }
+        Ok(observed)
     }
 
     /// ピアのトランスポートパラメータを返す
@@ -365,6 +430,10 @@ impl Connection {
     }
 
     /// QX_PING を送信し、シーケンス番号を返す
+    ///
+    /// 応答の到着は [`Self::recv_ping_ack`] で待つ。QMux Section 4.3 は、応答前に
+    /// 複数の要求を受けた場合に最大のシーケンス番号 1 件だけを返すことを許している
+    /// ため、要求と応答は 1 対 1 にならないことがある。
     pub async fn ping(&self) -> Result<u64> {
         let (reply, receive) = oneshot::channel();
         self.commands
@@ -372,6 +441,25 @@ impl Connection {
             .await
             .map_err(|_| Error::ConnectionClosed)?;
         receive.await.map_err(|_| Error::ConnectionClosed)?
+    }
+
+    /// ピアが返した QX_PING の応答 (シーケンス番号) を受け取る
+    ///
+    /// [`Self::ping`] が返したシーケンス番号以下で、まだ受け取っていない応答のうち
+    /// 最も新しいものを返す (`Event::PingAcknowledged` に対応する)。接続が閉じた
+    /// 場合は `Ok(None)` を返す。[`Self::accept_bidirectional`] と同様に `&self` で
+    /// 待てる。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// まだ受け取っていない応答は失われない。
+    pub async fn recv_ping_ack(&self) -> Result<Option<u64>> {
+        let sequence = self.ping_acks.lock().await.recv().await;
+        if sequence.is_some() {
+            self.wake_driver();
+        }
+        Ok(sequence)
     }
 
     /// 接続を閉じる
@@ -418,13 +506,16 @@ impl Connection {
 }
 
 /// バックグラウンドで接続を駆動する
-struct Driver {
+///
+/// `T` は下位トランスポートの型である。読み書きの半分をそのまま保持し、動的
+/// ディスパッチとヒープ確保を避ける。
+struct Driver<T> {
     /// Sans I/O の QMux 接続
     connection: QmuxConnection,
     /// 下位トランスポートの読み取り側
-    reader: Box<dyn AsyncRead + Send + Unpin>,
+    reader: tokio::io::ReadHalf<T>,
     /// 下位トランスポートの書き込み側
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    writer: tokio::io::WriteHalf<T>,
     /// アプリケーションからのコマンド受信
     command_rx: mpsc::Receiver<Command>,
     /// 接続を閉じる要求の受信 (容量 1 の専用チャネル)
@@ -439,6 +530,8 @@ struct Driver {
     datagram_tx: mpsc::Sender<Vec<u8>>,
     /// 接続単位の STOP_SENDING 通知の受け渡し
     stop_sending_tx: mpsc::Sender<StopSendingObserved>,
+    /// QX_PING の応答の受け渡し
+    ping_ack_tx: mpsc::Sender<u64>,
     /// ピアのトランスポートパラメータの通知
     peer_params_tx: watch::Sender<Option<TransportParameters>>,
     /// 破棄した受信 DATAGRAM の累計個数の通知
@@ -459,13 +552,33 @@ struct Driver {
     pending_commands: VecDeque<Command>,
     /// 接続単位の通知チャネルが埋まっているため保留している STOP_SENDING
     pending_stop_sending: VecDeque<StopSendingObserved>,
+    /// QX_PING の応答チャネルが埋まっているため保留している応答
+    pending_ping_acks: VecDeque<u64>,
+    /// 受信側のチャネルが埋まっているため保留しているストリームイベント
+    ///
+    /// ストリームごとの順序を保つため、先頭から順に配送する。
+    pending_stream_events: VecDeque<(StreamId, StreamEvent)>,
+    /// accept チャネルに空きが無いため保留しているピア起動ストリーム
+    ///
+    /// (ストリーム ID, 双方向かどうか) を保持し、空きができ次第ハンドルを登録する。
+    /// 登録するまで Sans I/O 側からデータを読まないため、保留分はフロー制御で
+    /// 有界になる。
+    pending_accept: VecDeque<(StreamId, bool)>,
+    /// 送信待ちの Record
+    ///
+    /// 1 つの Record は書き切ってから次を取り出す。書き込みの待ちはメインループの
+    /// `select!` の腕で行うため、書き込みが詰まっている間も受信・コマンド・タイマーが
+    /// 進む。
+    output: Vec<u8>,
+    /// `output` のうち書き出し済みのバイト数
+    written: usize,
     /// tokio 側のチャネルが埋まって破棄した DATAGRAM の累計個数
     datagram_drops: u64,
     /// ピアのトランスポートパラメータを受信済みかどうか
     established: bool,
-    /// 自側の close の後でピアの shutdown を待つ上限
+    /// 送信側を shutdown した後でピアの shutdown を待つ上限
     linger: Duration,
-    /// 自側の close を要求した時刻 (要求していない場合は `None`)
+    /// 接続が閉じた理由が確定した時刻 (確定していない場合は `None`)
     ///
     /// 期限を `Instant` の加算で持たないのは、桁あふれで panic するためである。
     /// 残り時間は `linger` から経過時間を引いて求める。
@@ -477,7 +590,7 @@ struct Driver {
     /// ストリーム読み取り用の作業バッファ
     read_scratch: Vec<u8>,
     /// ドライバ開始時刻
-    started: std::time::Instant,
+    started: Instant,
     /// 接続が閉じた理由
     close_reason: Option<CloseReason>,
     /// 下位トランスポートが閉じたかどうか
@@ -487,31 +600,10 @@ struct Driver {
 /// select で待つイベント
 enum Wake {
     Read(std::io::Result<usize>),
+    Write(std::io::Result<usize>),
     Command(Option<Command>),
     Close(Option<(u64, String)>),
     Timeout,
-}
-
-/// 送信フレームの書き出し結果
-enum FlushResult {
-    /// 送信待ちのフレームをすべて書き出した
-    Drained,
-    /// 下位トランスポートが使えなくなった
-    TransportFailed,
-    /// linger の上限を過ぎたため打ち切った
-    LingerExpired,
-}
-
-/// 下位トランスポートへの書き込みを待つ間に起きること
-enum WriteWake {
-    /// 書き込みを受け付けた (受け付けたバイト数)
-    Written(usize),
-    /// 下位トランスポートが使えなくなった
-    TransportFailed,
-    /// close 要求が届いた
-    CloseRequest(Option<(u64, String)>),
-    /// linger の上限を過ぎた
-    LingerExpired,
 }
 
 /// フロー制御で保留しているストリームデータ
@@ -525,45 +617,62 @@ struct PendingWrite {
     ack: oneshot::Sender<Result<()>>,
 }
 
-impl Driver {
+impl<T> Driver<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     /// ドライバのメインループ
+    ///
+    /// 読み取り・書き込み・コマンド・close 要求・タイマーを 1 つの `select!` で待つ。
+    /// 書き込みが詰まっている間も他の腕が動くため、ピアが読み取りを止めても受信・
+    /// コマンド・アイドルタイムアウトが進む。
     async fn run(mut self) {
         let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
-        let mut output = Vec::new();
 
         loop {
             self.process_events();
             self.update_datagram_drops();
+            self.retry_accept();
+            self.retry_stream_events();
             self.retry_stop_sending();
+            self.retry_ping_acks();
             if self.close_reason.is_none() {
                 self.retry_readable();
                 self.retry_writes();
             }
-            // 自側から閉じた場合は、そこから linger の上限を数える
-            if matches!(self.close_reason, Some(CloseReason::Local { .. })) {
+            // 接続が閉じた場合は、そこから送信側の shutdown と、ピアの shutdown を
+            // 待つ上限を数える
+            if self.close_reason.is_some() {
                 self.start_linger();
             }
-            match self.flush(&mut output).await {
-                FlushResult::Drained => {}
-                FlushResult::TransportFailed => {
-                    self.connection.transport_closed();
-                    self.transport_ended = true;
-                    self.process_events();
-                    self.update_datagram_drops();
-                    self.retry_stop_sending();
-                }
-                FlushResult::LingerExpired => {
-                    // ピアが読み取らないまま上限を過ぎた。以降の送信は行わない。
-                    // flush の中で close 要求を受けた場合、その理由はまだ
-                    // close_reason に反映されていないため、ここでイベントを取り出す。
-                    self.linger_expired = true;
-                    self.process_events();
+            // 送信する Record を用意する。書きかけの Record があるうちは次の
+            // Record を取り出さない (Record を途中で切らないため)
+            if self.written >= self.output.len() {
+                self.output.clear();
+                self.written = 0;
+                let now = self.now();
+                match self.connection.poll_transmit(&mut self.output, now) {
+                    Ok(true) => {}
+                    Ok(false) => self.output.clear(),
+                    Err(_) => {
+                        // 送信フレームを組み立てられない。接続を作り直すしかない
+                        self.connection.transport_closed();
+                        self.transport_ended = true;
+                        self.process_events();
+                        self.update_datagram_drops();
+                        self.retry_stop_sending();
+                    }
                 }
             }
-            // Section 7.2: 自側から閉じた場合は、CONNECTION_CLOSE を送った後に下位
-            // トランスポートの送信側を graceful に shutdown する。ピアが読み取って
-            // いなければ shutdown も完了しないため、shutdown の待ちも上限で打ち切る。
-            if matches!(self.close_reason, Some(CloseReason::Local { .. })) && !self.write_shutdown
+            // Section 7.2 / 7.3: 接続が閉じたら下位トランスポートの送信側を
+            // graceful に shutdown する。書きかけの Record があるうちは行わない。
+            // ピアが読み取っていなければ shutdown も完了しないため、shutdown の待ちも
+            // linger の上限で打ち切る。下位トランスポートの閉塞 (Section 7.4) では
+            // shutdown せずに即座に終了する。
+            if self.close_reason.is_some()
+                && !self.write_shutdown
+                && !matches!(self.close_reason, Some(CloseReason::TransportClosed))
+                && self.written >= self.output.len()
             {
                 self.write_shutdown = true;
                 if !self.shutdown_write_side().await {
@@ -571,17 +680,20 @@ impl Driver {
                     self.transport_ended = true;
                 }
             }
-            // 自分から閉じた場合は、CONNECTION_CLOSE を送った後にピアの shutdown を
-            // 待ってから終了する (draft-ietf-quic-qmux-02 Section 7.2)。ただし linger の
-            // 上限を過ぎたら終了する。ピアが shutdown しない場合や、ピアが読み取りを
-            // 止めて送信が詰まった場合でも、ドライバが残り続けないようにするためである。
-            // ピアの切断や下位トランスポートの閉塞を観測した場合は即座に終了する。
+            // 終了判定。自側から閉じた場合は、送信側を shutdown した後でピアの
+            // shutdown を待つ (draft-ietf-quic-qmux-02 Section 7.2)。ピア起因の切断や
+            // アイドルタイムアウトでは、自側の shutdown が済み次第終了する
+            // (Section 7.1 / 7.3)。いずれの場合も linger の上限を過ぎたら終了する。
             let should_break = self.linger_expired
                 || match &self.close_reason {
+                    Some(CloseReason::TransportClosed) => true,
                     Some(CloseReason::Local { .. }) => {
-                        self.transport_ended || self.linger_remaining().is_some_and(|r| r.is_zero())
+                        (self.write_shutdown && self.transport_ended)
+                            || self.linger_remaining().is_some_and(|r| r.is_zero())
                     }
-                    Some(_) => true,
+                    Some(_) => {
+                        self.write_shutdown || self.linger_remaining().is_some_and(|r| r.is_zero())
+                    }
                     None => false,
                 };
             if should_break {
@@ -589,37 +701,62 @@ impl Driver {
             }
 
             let sleep_duration = self.next_sleep_duration();
-            let timeout = async move {
-                match sleep_duration {
-                    Some(duration) => tokio::time::sleep(duration).await,
-                    None => core::future::pending::<()>().await,
-                }
-            };
             let wake = {
                 let reader = &mut self.reader;
+                let writer = &mut self.writer;
+                let output = &self.output;
+                let written = self.written;
                 let command_rx = &mut self.command_rx;
                 let close_request_rx = &mut self.close_request_rx;
+                // 偏りのある選択はしない。読み取りが連続する間もコマンド・close 要求・
+                // タイマーが飢餓にならないようにするためである。
                 tokio::select! {
-                    biased;
                     result = reader.read(read_buf.as_mut_slice()) => Wake::Read(result),
+                    result = async {
+                        // 書き出す Record が無いときは永久に待つ。0 バイトの書き込みを
+                        // 繰り返してビジーループにならないようにするためである。
+                        if written < output.len() {
+                            writer.write(&output[written..]).await
+                        } else {
+                            core::future::pending().await
+                        }
+                    } => Wake::Write(result),
                     command = command_rx.recv() => Wake::Command(command),
                     request = close_request_rx.recv() => Wake::Close(request),
-                    _ = timeout => Wake::Timeout,
+                    _ = sleep_for(sleep_duration) => Wake::Timeout,
                 }
             };
 
             match wake {
                 Wake::Read(Ok(0)) | Wake::Read(Err(_)) => {
-                    // 下位トランスポートが閉じた (Section 7.4)
+                    // 下位トランスポートが閉じた (Section 7.4)。I/O エラーの詳細は
+                    // 保持せず、切断理由は CloseReason::TransportClosed に丸める。
                     self.connection.transport_closed();
                     self.transport_ended = true;
                 }
                 Wake::Read(Ok(len)) => {
                     self.connection.receive(&read_buf[..len], self.now());
                 }
+                Wake::Write(Ok(0)) => {
+                    // 書き出しの途中で 0 バイトだった場合は下位トランスポートが閉じた
+                    if self.written < self.output.len() {
+                        self.connection.transport_closed();
+                        self.transport_ended = true;
+                        self.process_events();
+                    }
+                }
+                Wake::Write(Ok(len)) => {
+                    self.written += len;
+                }
+                Wake::Write(Err(_)) => {
+                    self.connection.transport_closed();
+                    self.transport_ended = true;
+                }
                 Wake::Command(Some(command)) => self.handle_command(command),
                 Wake::Command(None) => {
-                    // Connection がドロップされた
+                    // ドライバ自身が command_tx を保持しているため、通常ここには
+                    // 到達しない。到達した場合はアプリケーション側のハンドルが
+                    // すべて消えている。
                     self.connection.transport_closed();
                     self.transport_ended = true;
                 }
@@ -627,15 +764,12 @@ impl Driver {
                     self.connection.close(error_code, &reason);
                 }
                 Wake::Close(None) => {
-                    // Connection がドロップされ、閉じる要求も届かなくなった
+                    // Connection がドロップされた (close 要求チャネルの送信側が消えた)
                     self.connection.transport_closed();
                     self.transport_ended = true;
                 }
                 Wake::Timeout => {
                     self.connection.handle_timeout(self.now());
-                    if self.connection.is_closed() {
-                        self.transport_ended = true;
-                    }
                 }
             }
         }
@@ -669,10 +803,8 @@ impl Driver {
         }
     }
 
-    /// 自側の close の後でピアの shutdown を待つ上限を数え始める
-    ///
-    /// 送信が詰まっている間も close 要求を見ているため、メインループと [`Self::flush`]
-    /// の両方から呼ばれる。上限は close を要求した時点から数える。
+    /// 接続が閉じた理由が確定した時点から、送信側を shutdown してピアの shutdown を
+    /// 待つ上限を数え始める
     fn start_linger(&mut self) {
         if self.linger_started.is_none() {
             self.linger_started = Some(Instant::now());
@@ -681,7 +813,7 @@ impl Driver {
 
     /// linger の残り時間を返す
     ///
-    /// 自側の close を要求していない場合は `None` を返す。
+    /// 接続が閉じていない場合は `None` を返す。
     fn linger_remaining(&self) -> Option<Duration> {
         self.linger_started
             .map(|started| self.linger.saturating_sub(started.elapsed()))
@@ -735,8 +867,12 @@ impl Driver {
                     // 次のループで保留中の書き込みを再試行する
                 }
                 Event::StreamReset { id, error_code } => {
-                    self.send_event(id, StreamEvent::Reset(error_code));
-                    self.recv_streams.remove(&id);
+                    // リセットは失ってはならない制御信号である。チャネルが満杯の
+                    // 場合は配送待ちキューへ積む。
+                    if !self.send_event(id, StreamEvent::Reset(error_code)) {
+                        // 受信側がドロップ済みである。以後このストリームは読まない
+                        self.drop_recv_stream(id);
+                    }
                     self.pending_readable.remove(&id);
                 }
                 Event::StreamStopSending { id, error_code } => {
@@ -752,10 +888,16 @@ impl Driver {
                         self.datagram_drops = self.datagram_drops.saturating_add(1);
                     }
                 }
-                Event::Ping { .. } => {}
-                Event::PingAcknowledged { .. } => {}
+                Event::Ping { .. } => {
+                    // QX_PING の応答は Sans I/O 側が自動で返す。アプリケーションへ
+                    // 通知する必要はないため、ここでは捨てる。
+                }
+                Event::PingAcknowledged { sequence } => {
+                    // 応答は取りこぼさないよう、配送待ちキューへ積んでから配る
+                    self.pending_ping_acks.push_back(sequence);
+                }
                 Event::ConnectionClosed(reason) => {
-                    // 自分から閉じた場合は、ピアの shutdown を待つ間も理由を保持する
+                    // 自側の close の理由を、ピアの shutdown を待つ間も保持する
                     if self.close_reason.is_none() {
                         self.close_reason = Some(reason);
                     }
@@ -765,20 +907,42 @@ impl Driver {
     }
 
     /// ピア起動のストリームをアプリケーションへ渡す
+    ///
+    /// 受け渡しチャネルが満杯の場合は保留キューへ積む。ここでストリームを捨てると
+    /// ピアの MAX_STREAMS のクレジットが返らず、ピアが新しいストリームを開けなく
+    /// なるためである。
     fn on_stream_opened(&mut self, id: StreamId) {
-        if id.stream_type().is_bidirectional() {
-            let send = self.register_send(id);
-            let recv = self.register_recv(id);
-            if self.accept_bidirectional_tx.try_send((send, recv)).is_err() {
-                // アプリケーションが受け取らないまま接続が閉じた場合など
-                self.send_streams.remove(&id);
-                self.recv_streams.remove(&id);
-            }
-        } else {
-            let recv = self.register_recv(id);
-            // 単方向ストリームにはこちらから送信しないため送信側は作らない
-            if self.accept_unidirectional_tx.try_send(recv).is_err() {
-                self.recv_streams.remove(&id);
+        self.pending_accept
+            .push_back((id, id.stream_type().is_bidirectional()));
+    }
+
+    /// 保留しているピア起動ストリームを、空きのある accept チャネルへ配送する
+    ///
+    /// ハンドルを登録するまで Sans I/O 側からデータを読まないため、アプリケーションが
+    /// accept しない間の受信量はフロー制御で抑えられる。
+    fn retry_accept(&mut self) {
+        while let Some((id, bidirectional)) = self.pending_accept.pop_front() {
+            if bidirectional {
+                if self.accept_bidirectional_tx.capacity() == 0 {
+                    self.pending_accept.push_front((id, true));
+                    break;
+                }
+                let send = self.register_send(id);
+                let recv = self.register_recv(id);
+                if self.accept_bidirectional_tx.try_send((send, recv)).is_err() {
+                    // アプリケーションが accept をやめた (受信側がドロップされた)
+                    self.send_streams.remove(&id);
+                    self.recv_streams.remove(&id);
+                }
+            } else {
+                if self.accept_unidirectional_tx.capacity() == 0 {
+                    self.pending_accept.push_front((id, false));
+                    break;
+                }
+                let recv = self.register_recv(id);
+                if self.accept_unidirectional_tx.try_send(recv).is_err() {
+                    self.recv_streams.remove(&id);
+                }
             }
         }
     }
@@ -803,7 +967,7 @@ impl Driver {
     /// 送信待ちのデータを破棄し、送信側ハンドルへエラーコードを配送する。
     fn on_stop_sending(&mut self, id: StreamId, error_code: u64) {
         if let Some(tx) = self.send_streams.remove(&id) {
-            let _ = tx.try_send(SendEvent::StopSending(error_code));
+            let _ = tx.try_send(error_code);
         }
         if let Some(queue) = self.pending_writes.remove(&id) {
             for pending in queue {
@@ -832,6 +996,50 @@ impl Driver {
                     // Connection がドロップされ、通知先がなくなった
                     self.pending_stop_sending.clear();
                     break;
+                }
+            }
+        }
+    }
+
+    /// QX_PING の応答チャネルへ保留分を配送する
+    ///
+    /// 応答は接続の到達性の観測に使うため、取りこぼさないよう保留する。
+    fn retry_ping_acks(&mut self) {
+        while let Some(sequence) = self.pending_ping_acks.pop_front() {
+            match self.ping_ack_tx.try_send(sequence) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(sequence)) => {
+                    self.pending_ping_acks.push_front(sequence);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Connection がドロップされ、通知先がなくなった
+                    self.pending_ping_acks.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 配送待ちのストリームイベントを空きのあるチャネルへ配送する
+    ///
+    /// ストリームごとの順序を保つため、先頭から順に試し、満杯のものが現れた時点で
+    /// 打ち切って次回に回す (順序を入れ替えないため)。
+    fn retry_stream_events(&mut self) {
+        while let Some((id, event)) = self.pending_stream_events.pop_front() {
+            let Some(tx) = self.recv_streams.get(&id).cloned() else {
+                // 受信側が無い (終端済み) ため破棄する
+                continue;
+            };
+            match tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.pending_stream_events.push_front((id, event));
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // 受信側がドロップされた。以後このストリームは読まない
+                    self.drop_recv_stream(id);
                 }
             }
         }
@@ -876,10 +1084,11 @@ impl Driver {
                     }
                     Err(error) => {
                         // ストリームが終端したなど、これ以上送れない。保留している
-                        // 書き込みをすべて失敗させる
+                        // 書き込みをすべて失敗させる (接続自体は生きているため、
+                        // 接続断ではなくストリームの終端として返す)
                         let _ = pending.ack.send(Err(Error::Qmux(error)));
                         while let Some(rest) = queue.pop_front() {
-                            let _ = rest.ack.send(Err(Error::ConnectionClosed));
+                            let _ = rest.ack.send(Err(Error::StreamFinished));
                         }
                         break;
                     }
@@ -904,8 +1113,12 @@ impl Driver {
                 match result {
                     Ok(ReadResult::Data { len, fin }) => {
                         let data = self.read_scratch[..len].to_vec();
-                        if len > 0 || fin {
-                            self.send_event(id, StreamEvent::Data { data, fin });
+                        if (len > 0 || fin) && !self.send_event(id, StreamEvent::Data { data, fin })
+                        {
+                            // アプリケーションが受信側をドロップした。ピアへ送信停止を
+                            // 要求し、以後このストリームは読まない
+                            self.drop_recv_stream(id);
+                            break;
                         }
                         if fin {
                             self.recv_streams.remove(&id);
@@ -918,12 +1131,18 @@ impl Driver {
                         }
                     }
                     Ok(ReadResult::Reset { error_code }) => {
-                        self.send_event(id, StreamEvent::Reset(error_code));
-                        self.recv_streams.remove(&id);
+                        if !self.send_event(id, StreamEvent::Reset(error_code)) {
+                            self.drop_recv_stream(id);
+                        } else {
+                            self.recv_streams.remove(&id);
+                        }
                         self.pending_readable.remove(&id);
                         break;
                     }
                     Err(_) => {
+                        // 接続が閉じた、ストリームが終端したなど。アプリケーションが
+                        // 待ち続けないよう、チャネルを閉じる
+                        self.recv_streams.remove(&id);
                         self.pending_readable.remove(&id);
                         break;
                     }
@@ -933,70 +1152,32 @@ impl Driver {
     }
 
     /// ストリームへイベントを配送する
-    fn send_event(&mut self, id: StreamId, event: StreamEvent) {
-        if let Some(tx) = self.recv_streams.get(&id) {
-            let _ = tx.try_send(event);
+    ///
+    /// チャネルが満杯の場合は配送待ちキューへ積む。戻り値は受信側が存在するか
+    /// どうかで、`false` の場合はアプリケーションが受信側をドロップしている。
+    fn send_event(&mut self, id: StreamId, event: StreamEvent) -> bool {
+        let Some(tx) = self.recv_streams.get(&id).cloned() else {
+            return false;
+        };
+        match tx.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                self.pending_stream_events.push_back((id, event));
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
-    /// 保留している送信フレームを書き出す
+    /// 受信側がドロップされたストリームの読み取りを止める
     ///
-    /// ピアが読み取りを止めると書き込みが完了しなくなるため、`write_all` ではなく
-    /// オフセット付きの `AsyncWrite::write` を使い、`select!` で close 要求と linger の
-    /// 上限を同時に待つ。`write` は完了する前に破棄されてもバイト列を書かないため、
-    /// Record の書きかけの位置を失わない。`write_all` は途中まで書いた位置を内部に
-    /// 隠すため、この用途には使えない。
-    ///
-    /// 上限を過ぎた場合は書きかけの Record を諦めて終了する。ピアが読み取っていない
-    /// 以上その Record は届かないため、途中で切れていても構わない。
-    async fn flush(&mut self, output: &mut Vec<u8>) -> FlushResult {
-        loop {
-            output.clear();
-            let more = match self.connection.poll_transmit(output, self.now()) {
-                Ok(more) => more,
-                Err(_) => return FlushResult::TransportFailed,
-            };
-            if !more {
-                return FlushResult::Drained;
-            }
-            // 1 つの Record は最後まで書く。途中で切るとピアが Record を復元できない
-            // ため、ここで書き切ってから次の Record へ進む。
-            let mut written = 0;
-            while written < output.len() {
-                let remaining = self.linger_remaining();
-                let wake = {
-                    let writer = &mut self.writer;
-                    let close_request_rx = &mut self.close_request_rx;
-                    tokio::select! {
-                        biased;
-                        result = writer.write(&output[written..]) => match result {
-                            Ok(len) => WriteWake::Written(len),
-                            Err(_) => WriteWake::TransportFailed,
-                        },
-                        request = close_request_rx.recv() => WriteWake::CloseRequest(request),
-                        _ = sleep_for(remaining) => WriteWake::LingerExpired,
-                    }
-                };
-                match wake {
-                    // 0 バイトの書き込みは下位トランスポートが閉じたことを表す
-                    WriteWake::Written(0) => return FlushResult::TransportFailed,
-                    WriteWake::Written(len) => written += len,
-                    WriteWake::TransportFailed => return FlushResult::TransportFailed,
-                    WriteWake::CloseRequest(Some((error_code, reason))) => {
-                        // 送信中の Record は書き切ってから CONNECTION_CLOSE を送る。
-                        // 送信待ちのフレームは `close` が破棄するため、ここから linger の
-                        // 上限を数えれば、ピアが読み取らないままでも期限で終了できる。
-                        self.connection.close(error_code, &reason);
-                        self.start_linger();
-                    }
-                    WriteWake::CloseRequest(None) => {
-                        // Connection がドロップされ、閉じる要求も届かなくなった
-                        return FlushResult::TransportFailed;
-                    }
-                    WriteWake::LingerExpired => return FlushResult::LingerExpired,
-                }
-            }
-        }
+    /// アプリケーションがデータを受け取らないため、ピアへ送信停止 (STOP_SENDING) を
+    /// 要求し、以後このストリームを読まない (RFC 9000 Section 3.5)。エラーコードは
+    /// アプリケーション固有の値で、ここでは 0 (NO_ERROR) を使う。
+    fn drop_recv_stream(&mut self, id: StreamId) {
+        self.recv_streams.remove(&id);
+        self.pending_readable.remove(&id);
+        let _ = self.connection.stop_sending(id, 0);
     }
 
     /// アプリケーションからのコマンドを処理する
@@ -1045,7 +1226,7 @@ impl Driver {
                 // 送信待ちのデータはリセットで破棄される
                 if let Some(queue) = self.pending_writes.remove(&id) {
                     for pending in queue {
-                        let _ = pending.ack.send(Err(Error::ConnectionClosed));
+                        let _ = pending.ack.send(Err(Error::StreamFinished));
                     }
                 }
                 // 送信側をリセットすると STOP_SENDING の通知先は不要になる
@@ -1053,11 +1234,20 @@ impl Driver {
                 let result = self.connection.reset(id, error_code).map_err(Error::Qmux);
                 let _ = ack.send(result);
             }
-            Command::StopSending { id, error_code } => {
-                let _ = self.connection.stop_sending(id, error_code);
+            Command::StopSending {
+                id,
+                error_code,
+                ack,
+            } => {
+                let result = self
+                    .connection
+                    .stop_sending(id, error_code)
+                    .map_err(Error::Qmux);
+                let _ = ack.send(result);
             }
-            Command::Datagram(data) => {
-                let _ = self.connection.send_datagram(&data);
+            Command::Datagram { data, ack } => {
+                let result = self.connection.send_datagram(&data).map_err(Error::Qmux);
+                let _ = ack.send(result);
             }
             Command::Ping(reply) => {
                 let _ = reply.send(self.connection.ping().map_err(Error::Qmux));
@@ -1065,22 +1255,30 @@ impl Driver {
             Command::PollReadable { id } => {
                 self.pending_readable.insert(id);
             }
+            Command::DropRecvStream { id } => {
+                // 登録が残っている場合だけ、ピアへ送信停止を要求する (終端を配送済みの
+                // ストリームでは登録が外れているため何もしない)
+                if self.recv_streams.contains_key(&id) {
+                    self.drop_recv_stream(id);
+                }
+            }
+            Command::Wake => {
+                // 起床要求そのものに意味はない。ループ先頭の再試行で保留分が
+                // 配送されるため、ここでは何もしない。
+            }
         }
     }
 
     /// ドライバを終了し、アプリケーションへ切断を通知する
     ///
     /// `self` を消費するため、この関数を抜けると下位トランスポートも閉じられる。
+    /// 保持しているチャネルは drop で閉じるため、ここで明示的に破棄しない。
     fn finish(mut self) {
         let reason = self
             .close_reason
             .take()
             .unwrap_or(CloseReason::TransportClosed);
         let _ = self.closed_tx.send(Some(reason));
-        self.recv_streams.clear();
-        self.send_streams.clear();
-        self.pending_writes.clear();
-        self.pending_stop_sending.clear();
     }
 }
 

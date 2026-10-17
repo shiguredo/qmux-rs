@@ -17,8 +17,11 @@ pub enum Error {
     Reset(u64),
     /// ピアがストリームの送信停止を要求した (STOP_SENDING)
     Stopped(u64),
-    /// ドライバタスクが停止した
-    DriverStopped,
+    /// 送信側が終端済みのストリームへ書き込もうとした
+    ///
+    /// FIN を送った後のストリーム、またはピアの STOP_SENDING で終端した
+    /// ストリームへの書き込みである。
+    StreamFinished,
 }
 
 impl fmt::Display for Error {
@@ -31,7 +34,7 @@ impl fmt::Display for Error {
             Self::Stopped(code) => {
                 write!(f, "the peer stopped the stream (error code {code})")
             }
-            Self::DriverStopped => write!(f, "driver task has stopped"),
+            Self::StreamFinished => write!(f, "the stream has already been finished"),
         }
     }
 }

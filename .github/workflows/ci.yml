@@ -50,12 +50,20 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # 壊れた intra-doc リンクを検出するため、rustdoc の警告をエラーとして扱う。
+      # dwnx-sys は bindgen が生成する宣言 (dwnx.h のコメントをそのまま含む) を
+      # 持つため、rustdoc の警告の対象から除外する
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --exclude dwnx-sys
       # fuzz クレートは nightly と cargo-fuzz で独立にビルドするためワークスペースから除外している
       - name: Check fuzz crate
         if: matrix.os == 'ubuntu-26.04'
         run: |
           cargo fmt --manifest-path fuzz/Cargo.toml -- --check
           cargo check --manifest-path fuzz/Cargo.toml
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
   slack_notify:
     needs: [ci]
@@ -66,6 +74,8 @@ jobs:
       contents: read
     steps:
       - name: Slack Notification
+        # 時雨堂の社内 action であり、社内の修正を全リポジトリへ即時反映させるため、
+        # 他 action と異なり可変 ref の @main を意図的に使う
         uses: shiguredo/github-actions/.github/actions/slack-notify@main
         with:
           status: ${{ job.status }}

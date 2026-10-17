@@ -46,7 +46,7 @@ pub mod frame_type {
     pub const DATAGRAM: u64 = 0x30;
     pub const DATAGRAM_LEN: u64 = 0x31;
 
-    // Reliable Stream Reset 拡張 (draft-ietf-quic-reliable-stream-reset)
+    // Reliable Stream Reset 拡張 (draft-ietf-quic-reliable-stream-reset-11 Section 4)
     // QMux は本拡張をネゴシエートしないため、受信しても未知のフレームとして拒否する。
     // 値は暫定値であり、RFC 化時に変更される可能性がある。
     pub const RESET_STREAM_AT: u64 = 0x24;

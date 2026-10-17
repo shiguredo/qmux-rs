@@ -8,8 +8,8 @@ publish = false
 [dependencies]
 # Sans I/O の QMux 実装
 shiguredo_qmux = { path = "../.." }
-# 非同期ランタイム
-tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+# 非同期ランタイム (TCP は利用側が用意するため net は含めない)
+tokio = { version = "1.53", features = ["io-util", "macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # テストで #[tokio::test] と duplex / net を使う

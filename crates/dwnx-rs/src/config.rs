@@ -2,6 +2,27 @@
 
 use dwnx_sys as sys;
 
+use crate::error::Error;
+
+/// 1 ミリ秒を表す dwnx のタイムスタンプの刻み
+///
+/// dwnx.h の `DWNX_MILLISECONDS` と同じ値である。bindgen は型変換を含む
+/// マクロを展開しないため、ここで定義する。dwnx のタイムスタンプはナノ秒単位で
+/// あり (dwnx.h の `DWNX_NANOSECONDS`)、`DWNX_MICROSECONDS` はその 1000 倍、
+/// `DWNX_MILLISECONDS` はさらにその 1000 倍である。
+const DWNX_MILLISECONDS: u64 = 1_000_000;
+
+/// [`TransportParameters`] で指定できるストリーム数の初期値の上限
+///
+/// ピアは 1 つの MAX_STREAMS フレームで上限までストリームを開けるため、広告する
+/// 初期値が大きいほど、1 フレームで一括生成されるストリームとイベントの数が増える。
+/// [`TransportParameters::validate`] はこの値を超える `initial_max_streams_bidi` /
+/// `initial_max_streams_uni` を拒否する (draft-ietf-quic-qmux-02 Section 12.1,
+/// Section 12.2 の資源枯渇対策)。`shiguredo_qmux::config::MAX_CONFIG_STREAMS` と
+/// 同じ上限であり、RFC 9000 Section 4.6 が許容する 2^60 までの値をそのまま広告する
+/// ことはしない。
+pub const MAX_CONFIG_STREAMS: u64 = 1 << 16;
+
 /// dwnx のトランスポートパラメータ
 ///
 /// dwnx の `dwnx_transport_params` に対応する。`max_idle_timeout` は
@@ -42,6 +63,95 @@ impl Default for TransportParameters {
 }
 
 impl TransportParameters {
+    /// dwnx に渡せる値かどうかを検証する
+    ///
+    /// dwnx は `dwnx_conn_client_new` / `dwnx_conn_server_new` の中で
+    /// トランスポートパラメータを `assert` で検査する (dwnx の
+    /// `lib/dwnx_conn.c` の `conn_new`)。`assert` は `NDEBUG` を定義していない
+    /// ビルドではプロセスを abort させるため、同じ検査を Rust 側でも行う。
+    ///
+    /// # エラー
+    ///
+    /// dwnx の `assert` と同じ条件を満たさない場合は [`Error`]
+    /// (`DWNX_ERR_INVALID_ARGUMENT`) を返す。
+    pub fn validate(&self) -> Result<(), Error> {
+        let max_varint = sys::DWNX_MAX_VARINT;
+
+        // ピアが 1 つの MAX_STREAMS フレームで開けるストリーム数の実用上限
+        // (draft-ietf-quic-qmux-02 Section 12.1, Section 12.2 の資源枯渇対策)。
+        // 受信したピアのパラメータには上限を課さない (RFC 9000 Section 4.6 は
+        // 2^60 まで許容する)。
+        for (name, value) in [
+            ("initial_max_streams_bidi", self.initial_max_streams_bidi),
+            ("initial_max_streams_uni", self.initial_max_streams_uni),
+        ] {
+            if value > MAX_CONFIG_STREAMS {
+                return Err(Error::invalid_argument(format!(
+                    "{name} must not exceed MAX_CONFIG_STREAMS ({MAX_CONFIG_STREAMS})"
+                )));
+            }
+        }
+
+        // 各 initial_max_* は可変長整数として符号化するため DWNX_MAX_VARINT を
+        // 超えられない (dwnx の lib/dwnx_conv.c の dwnx_put_uvarint を参照)。
+        // initial_max_stream_data_uni だけは conn_new の assert に無いが、局所
+        // トランスポートパラメータの符号化時に同じ assert に掛かる。
+        for (name, value) in [
+            (
+                "initial_max_stream_data_bidi_local",
+                self.initial_max_stream_data_bidi_local,
+            ),
+            (
+                "initial_max_stream_data_bidi_remote",
+                self.initial_max_stream_data_bidi_remote,
+            ),
+            (
+                "initial_max_stream_data_uni",
+                self.initial_max_stream_data_uni,
+            ),
+            ("initial_max_data", self.initial_max_data),
+            ("initial_max_streams_bidi", self.initial_max_streams_bidi),
+            ("initial_max_streams_uni", self.initial_max_streams_uni),
+        ] {
+            if value > max_varint {
+                return Err(Error::invalid_argument(format!(
+                    "{name} must not exceed DWNX_MAX_VARINT ({max_varint})"
+                )));
+            }
+        }
+
+        // max_idle_timeout は「無効」を 0 で表すため、UINT64_MAX を値として
+        // 受け付けない
+        if self.max_idle_timeout == u64::MAX {
+            return Err(Error::invalid_argument(
+                "max_idle_timeout must not be UINT64_MAX",
+            ));
+        }
+        // max_idle_timeout はミリ秒単位の可変長整数として送るため、ミリ秒に
+        // 換算した値が DWNX_MAX_VARINT を超えられない
+        if self.max_idle_timeout / DWNX_MILLISECONDS > max_varint {
+            return Err(Error::invalid_argument(format!(
+                "max_idle_timeout must not exceed DWNX_MAX_VARINT milliseconds ({max_varint})"
+            )));
+        }
+
+        if self.max_record_size > max_varint {
+            return Err(Error::invalid_argument(format!(
+                "max_record_size must not exceed DWNX_MAX_VARINT ({max_varint})"
+            )));
+        }
+        // ピアが送る Record を受け取るバッファの大きさが既定値を下回ると、
+        // dwnx は Record を組み立てられない
+        if self.max_record_size < u64::from(sys::DWNX_DEFAULT_MAX_RECORD_SIZE) {
+            return Err(Error::invalid_argument(format!(
+                "max_record_size must be at least DWNX_DEFAULT_MAX_RECORD_SIZE ({})",
+                sys::DWNX_DEFAULT_MAX_RECORD_SIZE
+            )));
+        }
+
+        Ok(())
+    }
+
     /// FFI の構造体へ変換する
     pub(crate) fn to_ffi(&self) -> sys::dwnx_transport_params {
         sys::dwnx_transport_params {
@@ -70,6 +180,3 @@ impl TransportParameters {
         }
     }
 }
-
-/// dwnx 接続の設定
-pub type Config = TransportParameters;

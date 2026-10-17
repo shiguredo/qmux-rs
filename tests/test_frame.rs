@@ -103,9 +103,9 @@ fn prohibited_frames_are_rejected() {
 #[test]
 fn unknown_and_unsupported_frames_are_rejected() {
     // Section 4 と RFC 9000 Section 12.4: 未知のフレームタイプは FRAME_ENCODING_ERROR。
-    // 0x24 (RESET_STREAM_AT) は本実装がネゴシエートしない拡張のフレーム。
-    for frame_type in [0x24, 0x3e75, 0x3f51, 0x1234] {
-        let buf = frame_with_type(frame_type);
+    // RESET_STREAM_AT は本実装がネゴシエートしない拡張のフレーム (値は暫定)。
+    for ft in [frame::frame_type::RESET_STREAM_AT, 0x3e75, 0x3f51, 0x1234] {
+        let buf = frame_with_type(ft);
         let error = decode(&buf).expect_err("未知のフレームタイプは拒否される");
         assert_protocol_error(error, TransportErrorCode::FRAME_ENCODING_ERROR);
     }
@@ -161,5 +161,7 @@ fn prohibited_and_unknown_classification() {
     assert!(!shiguredo_qmux::frame::is_allowed(
         frame::frame_type::CRYPTO
     ));
-    assert!(!shiguredo_qmux::frame::is_allowed(0x24));
+    assert!(!shiguredo_qmux::frame::is_allowed(
+        frame::frame_type::RESET_STREAM_AT
+    ));
 }
