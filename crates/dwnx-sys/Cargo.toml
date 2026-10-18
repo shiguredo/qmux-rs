@@ -10,7 +10,7 @@ publish = false
 # 以降は外部ライブラリビルド用のメタデータ
 # (この内容は build.rs の中からのみ参照される)
 [package.metadata.external-dependencies]
-dwnx = { git = "https://github.com/ngtcp2/dwnx.git", ref = "3941ae176af6aa8f878a83d082ad099101b6de2a" }
+dwnx = { git = "https://github.com/ngtcp2/dwnx.git", ref = "aeb481c7098a7d326047ffa52740c0f4e4fa2d48" }
 
 [lib]
 # bindings.rs は自動生成されたファイルで C のコード例を含むため doctest を無効化

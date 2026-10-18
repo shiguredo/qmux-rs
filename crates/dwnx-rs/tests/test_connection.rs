@@ -4,7 +4,9 @@
 //! 使ってストリームとタイムアウトの振る舞いを検証する。下位トランスポートは
 //! 使わないため、モックは不要である。
 
-use dwnx_rs::{Connection, Event, MAX_CONFIG_STREAMS, TransportParameters, WriteEvent};
+use dwnx_rs::{
+    Connection, DatagramEvent, Event, MAX_CONFIG_STREAMS, TransportParameters, WriteEvent,
+};
 use dwnx_sys as sys;
 
 /// テストで使う時刻 (ナノ秒)
@@ -23,6 +25,18 @@ fn test_config() -> TransportParameters {
         initial_max_streams_uni: 8,
         max_idle_timeout: 30_000_000_000,
         ..TransportParameters::default()
+    }
+}
+
+/// DATAGRAM を有効にしたテスト用の設定
+///
+/// `max_datagram_frame_size` は受信を受け付ける DATAGRAM フレームの最大サイズで
+/// あり、0 は DATAGRAM 拡張の非サポートを表す (RFC 9221 Section 3)。DATAGRAM を
+/// 有効にするには 0 より大きい値を指定する必要がある。
+fn datagram_config(max_datagram_frame_size: u64) -> TransportParameters {
+    TransportParameters {
+        max_datagram_frame_size,
+        ..test_config()
     }
 }
 
@@ -106,6 +120,17 @@ fn count_data_events(events: &[Event], id: i64) -> usize {
         .iter()
         .filter(|event| matches!(event, Event::StreamData { id: event_id, .. } if *event_id == id))
         .count()
+}
+
+/// DATAGRAM イベントのデータを順番に取り出す
+fn collect_datagrams(events: &[Event]) -> Vec<Vec<u8>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Datagram { data } => Some(data.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -304,11 +329,20 @@ fn close_truncates_reason_that_does_not_fit() {
 fn invalid_config_is_rejected() {
     // dwnx の conn_new の assert と同じ条件を Rust 側で検査し、プロセスを
     // abort させずにエラーを返すこと
-    let cases: [(&str, TransportParameters); 6] = [
+    let cases: [(&str, TransportParameters); 8] = [
         (
             "max_record_size が既定値未満",
             TransportParameters {
                 max_record_size: 0,
+                ..test_config()
+            },
+        ),
+        (
+            "max_record_size が既定値超",
+            TransportParameters {
+                // dwnx はアプリケーションの指定を既定値へ強制するため、
+                // 既定値以外は設定の誤りとして拒否する
+                max_record_size: 65535,
                 ..test_config()
             },
         ),
@@ -344,6 +378,13 @@ fn invalid_config_is_rejected() {
             "initial_max_stream_data_uni が DWNX_MAX_VARINT 超",
             TransportParameters {
                 initial_max_stream_data_uni: u64::MAX,
+                ..test_config()
+            },
+        ),
+        (
+            "max_datagram_frame_size が DWNX_MAX_VARINT 超",
+            TransportParameters {
+                max_datagram_frame_size: u64::MAX,
                 ..test_config()
             },
         ),
@@ -470,4 +511,578 @@ fn config_stream_limit_is_enforced() {
             "{name} が上限を超えたらサーバーを作成できないこと"
         );
     }
+}
+
+#[test]
+fn datagram_transport_parameter_is_transferred() {
+    // DATAGRAM 拡張は max_datagram_frame_size の交換でネゴシエートする
+    // (RFC 9221 Section 3)。自分が広告した値がピアに届くことと、既定値 0 が
+    // DATAGRAM の非サポートとして伝わることを検証する。
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&test_config()).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+
+    // クライアントが広告した値がサーバーへ届くこと
+    let mut client_params = None;
+    for event in drain_events(&mut server) {
+        if let Event::TransportParametersReceived(params) = event {
+            client_params = Some(params);
+        }
+    }
+    let client_params = client_params.expect("クライアントのトランスポートパラメータが届く");
+    assert_eq!(
+        client_params.max_datagram_frame_size, 4096,
+        "広告した max_datagram_frame_size がピアへ届くこと"
+    );
+
+    // サーバーは既定値 (0) を広告しており、DATAGRAM の非サポートとして届くこと
+    let mut server_params = None;
+    for event in drain_events(&mut client) {
+        if let Event::TransportParametersReceived(params) = event {
+            server_params = Some(params);
+        }
+    }
+    let server_params = server_params.expect("サーバーのトランスポートパラメータが届く");
+    assert_eq!(
+        server_params.max_datagram_frame_size, 0,
+        "DATAGRAM を無効にした接続の max_datagram_frame_size が 0 として届くこと"
+    );
+}
+
+#[test]
+fn client_sends_datagram_to_server() {
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(4096)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    assert!(
+        client.send_datagram(b"hello datagram"),
+        "DATAGRAM を送信待ちに積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+
+    // 送信側では DATAGRAM が Record に収められたことが通知されること
+    match client.poll_datagram_event() {
+        Some(DatagramEvent::Accepted) => {}
+        other => panic!("DATAGRAM の完了が通知されない: {other:?}"),
+    }
+    assert!(
+        client.poll_datagram_event().is_none(),
+        "余分な DATAGRAM の通知が無いこと"
+    );
+
+    // 受信側ではデータがそのまま届くこと
+    let datagrams = collect_datagrams(&drain_events(&mut server));
+    assert_eq!(
+        datagrams,
+        vec![b"hello datagram".to_vec()],
+        "送信した DATAGRAM が届くこと"
+    );
+}
+
+#[test]
+fn server_sends_datagram_to_client() {
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(4096)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    // 双方向のどちらからでも DATAGRAM を送れること
+    assert!(
+        server.send_datagram(b"pong datagram"),
+        "サーバーが DATAGRAM を送信待ちに積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+
+    match server.poll_datagram_event() {
+        Some(DatagramEvent::Accepted) => {}
+        other => panic!("DATAGRAM の完了が通知されない: {other:?}"),
+    }
+    let datagrams = collect_datagrams(&drain_events(&mut client));
+    assert_eq!(
+        datagrams,
+        vec![b"pong datagram".to_vec()],
+        "サーバーが送信した DATAGRAM がクライアントへ届くこと"
+    );
+}
+
+#[test]
+fn multiple_datagrams_and_empty_datagram_are_transferred() {
+    // 空の DATAGRAM は 0 バイトの DATAGRAM フレームとして送れる
+    // (RFC 9221 Section 4)
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(4096)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    let payloads: [&[u8]; 3] = [b"first", b"", b"third"];
+    for payload in payloads {
+        assert!(
+            client.send_datagram(payload),
+            "DATAGRAM を送信待ちに積めること"
+        );
+    }
+    pump(&mut client, &mut server, NOW);
+
+    // 積んだ数だけ完了が通知されること
+    let mut accepted = 0;
+    while let Some(event) = client.poll_datagram_event() {
+        match event {
+            DatagramEvent::Accepted => accepted += 1,
+            DatagramEvent::Failed { error } => panic!("DATAGRAM の送信に失敗した: {error}"),
+        }
+    }
+    assert_eq!(
+        accepted, 3,
+        "積んだ 3 つの DATAGRAM すべての完了が通知されること"
+    );
+
+    // 複数の DATAGRAM が積んだ順に届き、空の DATAGRAM も 1 つのイベントになること
+    let datagrams = collect_datagrams(&drain_events(&mut server));
+    assert_eq!(
+        datagrams,
+        vec![b"first".to_vec(), Vec::new(), b"third".to_vec()],
+        "複数の DATAGRAM が積んだ順に届き、空の DATAGRAM も届くこと"
+    );
+}
+
+#[test]
+fn partially_delivered_datagram_is_assembled() {
+    // dwnx は入力バイト列がフレームの途中で区切られると、1 つの DATAGRAM を
+    // 複数のチャンクとして recv_datagram コールバックへ通知する。dwnx-rs が
+    // チャンクを連結して 1 つの Event::Datagram にすることを、Record を
+    // 1 バイトずつ読ませて検証する。
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(4096)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut server);
+
+    let payload = b"partially delivered datagram";
+    assert!(
+        client.send_datagram(payload),
+        "DATAGRAM を送信待ちに積めること"
+    );
+    let mut record = Vec::new();
+    assert!(
+        client.poll_transmit(&mut record, NOW).expect("送信できる"),
+        "DATAGRAM を含む Record が書き出されること"
+    );
+    assert!(
+        record.len() > 1,
+        "1 バイトずつ読める大きさの Record であること"
+    );
+
+    // Record を 1 バイトずつ渡し、DATAGRAM が部分配送される状況を作る
+    for byte in &record {
+        server
+            .read(core::slice::from_ref(byte), NOW)
+            .expect("1 バイトずつ読み取れる");
+    }
+
+    let events = drain_events(&mut server);
+    assert_eq!(
+        collect_datagrams(&events),
+        vec![payload.to_vec()],
+        "部分配送された DATAGRAM が 1 つのイベントに組み立てられること"
+    );
+    assert!(
+        matches!(client.poll_datagram_event(), Some(DatagramEvent::Accepted)),
+        "部分配送されても送信側の完了は 1 回だけ通知されること"
+    );
+}
+
+#[test]
+fn datagram_to_peer_without_support_is_reported_as_failure() {
+    // ピアが DATAGRAM 拡張を広告していない (max_datagram_frame_size が 0) 場合、
+    // 送信は DWNX_ERR_INVALID_STATE で失敗するが接続は閉じない
+    // (RFC 9221 Section 3、dwnx.h の dwnx_conn_writev_datagram を参照)。
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&test_config()).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut server);
+
+    assert!(
+        client.send_datagram(b"unsupported"),
+        "DATAGRAM を送信待ちに積めること"
+    );
+    // DATAGRAM は失敗するが、制御フレームだけの Record が出ることはある
+    let mut out = Vec::new();
+    for _ in 0..16 {
+        if !client.poll_transmit(&mut out, NOW).expect("送信できる") {
+            break;
+        }
+    }
+
+    match client.poll_datagram_event() {
+        Some(DatagramEvent::Failed { error }) => {
+            assert_eq!(
+                error.code,
+                sys::DWNX_ERR_INVALID_STATE,
+                "ピア非対応は DWNX_ERR_INVALID_STATE として通知されること"
+            );
+        }
+        other => panic!("DATAGRAM の失敗が通知されない: {other:?}"),
+    }
+    assert!(
+        !client.is_closed(),
+        "DATAGRAM 非対応は接続の終了ではないこと"
+    );
+
+    // 接続は引き続き使える (ストリームは DATAGRAM と独立している)
+    let id = client.open_bidi().expect("ストリームを開ける");
+    assert!(
+        client.write(id, b"still alive", false),
+        "データを積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+    let (data, _fin) = collect_stream_data(&drain_events(&mut server), id);
+    assert_eq!(
+        data, b"still alive",
+        "DATAGRAM 非対応のピアともストリームは使えること"
+    );
+}
+
+#[test]
+fn datagram_larger_than_peer_limit_is_reported_as_failure() {
+    // フレーム全体 (タイプと Length を含む) がピアの max_datagram_frame_size を
+    // 超える場合、送信は DWNX_ERR_INVALID_ARGUMENT で失敗するが接続は閉じない。
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(100)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut server);
+
+    let payload = vec![0x5au8; 200];
+    assert!(
+        client.send_datagram(&payload),
+        "DATAGRAM を送信待ちに積めること"
+    );
+    let mut out = Vec::new();
+    for _ in 0..16 {
+        if !client.poll_transmit(&mut out, NOW).expect("送信できる") {
+            break;
+        }
+    }
+
+    match client.poll_datagram_event() {
+        Some(DatagramEvent::Failed { error }) => {
+            assert_eq!(
+                error.code,
+                sys::DWNX_ERR_INVALID_ARGUMENT,
+                "サイズ超過は DWNX_ERR_INVALID_ARGUMENT として通知されること"
+            );
+        }
+        other => panic!("DATAGRAM の失敗が通知されない: {other:?}"),
+    }
+    assert!(!client.is_closed(), "サイズ超過は接続の終了ではないこと");
+    assert!(
+        collect_datagrams(&drain_events(&mut server)).is_empty(),
+        "大きすぎる DATAGRAM はピアへ届かないこと"
+    );
+}
+
+#[test]
+fn datagram_at_record_capacity_limit_is_sent() {
+    // dwnx-rs の送信バッファは DWNX_DEFAULT_MAX_RECORD_SIZE (16382) バイトで、
+    // dwnx の Record 符号化器が先頭 2 バイトを Record 長に使うため、フレームに
+    // 使えるのは 16380 バイトである。DATAGRAM フレームはタイプ 1 バイト +
+    // Length 2 バイト + ペイロードなので、ペイロード 16377 バイトが上限になる。
+    let mut client = Connection::client(&datagram_config(65535)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(65535)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    let payload = vec![0xa5u8; 16377];
+    assert!(
+        client.send_datagram(&payload),
+        "上限ちょうどの DATAGRAM を送信待ちに積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+
+    match client.poll_datagram_event() {
+        Some(DatagramEvent::Accepted) => {}
+        other => panic!("上限ちょうどの DATAGRAM の完了が通知されない: {other:?}"),
+    }
+    let datagrams = collect_datagrams(&drain_events(&mut server));
+    assert_eq!(
+        datagrams.len(),
+        1,
+        "上限ちょうどの DATAGRAM が 1 つ届くこと"
+    );
+    assert_eq!(
+        datagrams[0], payload,
+        "上限ちょうどの DATAGRAM のデータが一致すること"
+    );
+}
+
+#[test]
+fn datagram_exceeding_record_capacity_is_reported_as_failure() {
+    // 上限を 1 バイト超えるペイロード 16378 バイトは、ピアが十分大きい
+    // max_datagram_frame_size を広告していても、ローカルの Record 容量に収まらない。
+    // dwnx はこの場合の DWNX_ERR_NOBUF を握りつぶして何も返さないため、
+    // dwnx-rs が事前に検査して失敗を通知する。通知しないと送信待ちが永久に残る。
+    let mut client = Connection::client(&datagram_config(65535)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(65535)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut server);
+
+    let payload = vec![0x5au8; 16378];
+    assert!(
+        client.send_datagram(&payload),
+        "収まらない DATAGRAM も失敗として通知するため true を返すこと"
+    );
+
+    // 送信できる Record が無いため、poll_transmit はすぐ false を返すこと。
+    // 以前はここで永久に false を返し続け、失敗も通知されなかった。
+    let mut out = Vec::new();
+    assert!(
+        !client.poll_transmit(&mut out, NOW).expect("送信できる"),
+        "Record に収まらない DATAGRAM は送信されないこと"
+    );
+
+    match client.poll_datagram_event() {
+        Some(DatagramEvent::Failed { error }) => {
+            assert_eq!(
+                error.code,
+                sys::DWNX_ERR_INVALID_ARGUMENT,
+                "ローカルの Record 容量超過は DWNX_ERR_INVALID_ARGUMENT として通知されること"
+            );
+        }
+        other => panic!("DATAGRAM の失敗が通知されない: {other:?}"),
+    }
+    assert!(
+        !client.is_closed(),
+        "ローカルの Record 容量超過は接続の終了ではないこと"
+    );
+    assert!(
+        collect_datagrams(&drain_events(&mut server)).is_empty(),
+        "収まらない DATAGRAM はピアへ届かないこと"
+    );
+
+    // 接続は引き続き使える。上限内の DATAGRAM は送れる
+    assert!(
+        client.send_datagram(b"fits"),
+        "上限内の DATAGRAM を送信待ちに積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+    assert_eq!(
+        collect_datagrams(&drain_events(&mut server)),
+        vec![b"fits".to_vec()],
+        "上限内の DATAGRAM は失敗の後でも送れること"
+    );
+}
+
+#[test]
+fn datagram_failure_keeps_submission_order() {
+    // 送信待ちの DATAGRAM の完了通知は、積んだ順に取り出せること。
+    // 失敗を即座に先頭へ積むと、tokio-dwnx の ack の対応付けがずれる。
+    let mut client = Connection::client(&datagram_config(65535)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(65535)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    assert!(
+        client.send_datagram(b"first"),
+        "1 つ目の DATAGRAM を積めること"
+    );
+    assert!(
+        client.send_datagram(&vec![0u8; 16378]),
+        "収まらない 2 つ目の DATAGRAM を積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+
+    match client.poll_datagram_event() {
+        Some(DatagramEvent::Accepted) => {}
+        other => panic!("1 つ目の完了が通知されない: {other:?}"),
+    }
+    match client.poll_datagram_event() {
+        Some(DatagramEvent::Failed { error }) => {
+            assert_eq!(
+                error.code,
+                sys::DWNX_ERR_INVALID_ARGUMENT,
+                "2 つ目はサイズ超過として通知されること"
+            );
+        }
+        other => panic!("2 つ目の失敗が通知されない: {other:?}"),
+    }
+    assert!(
+        client.poll_datagram_event().is_none(),
+        "通知は積んだ数だけであること"
+    );
+
+    assert_eq!(
+        collect_datagrams(&drain_events(&mut server)),
+        vec![b"first".to_vec()],
+        "成功した DATAGRAM だけがピアへ届くこと"
+    );
+}
+
+#[test]
+fn datagram_is_delivered_while_stream_is_blocked_by_flow_control() {
+    // フロー制御でストリームがブロックされている間も、DATAGRAM はフロー制御
+    // されないためピアへ届くこと (RFC 9221 Section 5.1)。dwnx-rs はブロック中の
+    // ストリームがあると Record を確定できず、DATAGRAM が Accepted のまま
+    // 送信されないことがあった。
+    let server_params = TransportParameters {
+        initial_max_stream_data_bidi_remote: 8,
+        initial_max_data: 8,
+        max_datagram_frame_size: 4096,
+        ..test_config()
+    };
+    let client_params = datagram_config(4096);
+    let mut client = Connection::client(&client_params).expect("クライアントを作成できる");
+    let mut server = Connection::server(&server_params).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut server);
+
+    // クライアントが 64 バイトを書くが、ピアのクレジットは 8 バイトしかない
+    let id = client.open_bidi().expect("ストリームを開ける");
+    assert!(
+        client.write(id, &[0x11u8; 64], false),
+        "書き込みを積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+
+    // サーバーがクレジットを返さないため、8 バイトだけ届いて残りはブロックされる
+    let events = drain_events(&mut server);
+    let (mut stream_data, _fin) = collect_stream_data(&events, id);
+    assert_eq!(stream_data.len(), 8, "クレジットの分だけデータが届くこと");
+
+    // ブロックされたストリームを残したまま DATAGRAM を送る
+    assert!(
+        client.send_datagram(b"datagram while blocked"),
+        "DATAGRAM を送信待ちに積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+
+    // クレジットを返さなくても DATAGRAM が届くこと
+    let events = drain_events(&mut server);
+    assert_eq!(
+        collect_datagrams(&events),
+        vec![b"datagram while blocked".to_vec()],
+        "ストリームがブロックされていても DATAGRAM が届くこと"
+    );
+    let mut accepted = 0;
+    while let Some(event) = client.poll_datagram_event() {
+        match event {
+            DatagramEvent::Accepted => accepted += 1,
+            DatagramEvent::Failed { error } => panic!("DATAGRAM の送信に失敗した: {error}"),
+        }
+    }
+    assert_eq!(accepted, 1, "DATAGRAM の完了が通知されること");
+
+    // クレジットを返すと保留していたストリームデータが届くこと
+    server
+        .extend_max_stream_offset(id, 64)
+        .expect("ストリームの受信ウィンドウを広げられる");
+    server.extend_max_offset(64);
+    pump(&mut client, &mut server, NOW);
+    let events = drain_events(&mut server);
+    let (remaining, _fin) = collect_stream_data(&events, id);
+    stream_data.extend_from_slice(&remaining);
+    assert_eq!(
+        stream_data.len(),
+        64,
+        "クレジットを返すと保留していた残りが届くこと"
+    );
+    assert!(
+        stream_data.iter().all(|byte| *byte == 0x11),
+        "受け取るデータがすべて一致すること"
+    );
+}
+
+#[test]
+fn blocked_stream_does_not_starve_other_streams() {
+    // 先頭のストリームがフロー制御でブロックされても、後続のストリームの
+    // 送信が飢餓にならないこと。同じストリーム内の送信順序は保たれる。
+    let server_params = TransportParameters {
+        initial_max_stream_data_bidi_remote: 8,
+        initial_max_data: 64 * 1024,
+        max_datagram_frame_size: 4096,
+        ..test_config()
+    };
+    let client_params = datagram_config(4096);
+    let mut client = Connection::client(&client_params).expect("クライアントを作成できる");
+    let mut server = Connection::server(&server_params).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+
+    // 2 本のストリームに、それぞれストリームのクレジットを超えるデータを積む
+    let first = client.open_bidi().expect("1 本目のストリームを開ける");
+    let second = client.open_bidi().expect("2 本目のストリームを開ける");
+    assert!(
+        client.write(first, &[0x11u8; 64], false),
+        "1 本目の書き込みを積めること"
+    );
+    assert!(
+        client.write(second, &[0x22u8; 64], false),
+        "2 本目の書き込みを積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+
+    // どちらのストリームもクレジットの 8 バイトずつが届くこと。
+    // 1 本目がブロックされた状態で 2 本目が送られないと、2 本目は 0 バイトになる。
+    let events = drain_events(&mut server);
+    let (first_data, _) = collect_stream_data(&events, first);
+    let (second_data, _) = collect_stream_data(&events, second);
+    assert_eq!(
+        first_data,
+        vec![0x11u8; 8],
+        "1 本目がクレジットの分だけ届くこと"
+    );
+    assert_eq!(
+        second_data,
+        vec![0x22u8; 8],
+        "1 本目がブロックされても 2 本目が飢餓にならないこと"
+    );
+}
+
+#[test]
+fn stream_data_and_datagram_share_one_record() {
+    // ストリームデータと DATAGRAM を同じ Record に収められること。
+    // dwnx は 1 つの Record に複数のフレームを並べられる (1 回の
+    // dwnx_conn_read で両方のイベントが出ることで確認する)。
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(4096)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut server);
+
+    let id = client.open_bidi().expect("ストリームを開ける");
+    assert!(
+        client.write(id, b"in same record", false),
+        "ストリームデータを積めること"
+    );
+    assert!(
+        client.send_datagram(b"same record datagram"),
+        "DATAGRAM を送信待ちに積めること"
+    );
+
+    // 1 回の poll_transmit で両方を含む Record が書き出されること
+    let mut record = Vec::new();
+    assert!(
+        client.poll_transmit(&mut record, NOW).expect("送信できる"),
+        "Record が書き出されること"
+    );
+
+    // 1 回の read で両方のイベントが通知されること
+    server.read(&record, NOW).expect("Record を読み取れる");
+    let events = drain_events(&mut server);
+    assert!(
+        events.contains(&Event::StreamOpened { id }),
+        "同じ Record からストリームの open が通知されること"
+    );
+    let (data, _fin) = collect_stream_data(&events, id);
+    assert_eq!(
+        data, b"in same record",
+        "同じ Record のストリームデータが届くこと"
+    );
+    assert_eq!(
+        collect_datagrams(&events),
+        vec![b"same record datagram".to_vec()],
+        "同じ Record の DATAGRAM が届くこと"
+    );
 }

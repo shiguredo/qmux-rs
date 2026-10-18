@@ -44,7 +44,19 @@ pub struct TransportParameters {
     /// アイドルタイムアウト (ナノ秒、0 は無効)
     pub max_idle_timeout: u64,
     /// ピアが送信できる QMux Record の Size の上限
+    ///
+    /// dwnx はアプリケーションが指定した値を既定値
+    /// (`DWNX_DEFAULT_MAX_RECORD_SIZE`) に強制するため (dwnx の
+    /// `lib/dwnx_conn.c` の `conn_new` にある "We do not let application increase
+    /// max record size.")、この値は既定値と等しくなければならない。
+    /// [`TransportParameters::validate`] は既定値以外を拒否する。
     pub max_record_size: u64,
+    /// 受信を受け付ける DATAGRAM フレームの最大サイズ (RFC 9221 Section 3)
+    ///
+    /// 0 は DATAGRAM 拡張を使わないことを表し、その場合ピアは DATAGRAM を
+    /// 送れない。DATAGRAM を受信するには 0 より大きい値を指定する。
+    /// dwnx の `dwnx_transport_params` の `max_datagram_frame_size` に対応する。
+    pub max_datagram_frame_size: u64,
 }
 
 impl Default for TransportParameters {
@@ -58,6 +70,7 @@ impl Default for TransportParameters {
             initial_max_streams_uni: 0,
             max_idle_timeout: 0,
             max_record_size: u64::from(sys::DWNX_DEFAULT_MAX_RECORD_SIZE),
+            max_datagram_frame_size: 0,
         }
     }
 }
@@ -69,10 +82,12 @@ impl TransportParameters {
     /// トランスポートパラメータを `assert` で検査する (dwnx の
     /// `lib/dwnx_conn.c` の `conn_new`)。`assert` は `NDEBUG` を定義していない
     /// ビルドではプロセスを abort させるため、同じ検査を Rust 側でも行う。
+    /// `assert` に掛からない値でも、dwnx が黙って上書きする `max_record_size`
+    /// のような設定は既定値以外を拒否する。
     ///
     /// # エラー
     ///
-    /// dwnx の `assert` と同じ条件を満たさない場合は [`Error`]
+    /// dwnx が受け付けない設定の場合は [`Error`]
     /// (`DWNX_ERR_INVALID_ARGUMENT`) を返す。
     pub fn validate(&self) -> Result<(), Error> {
         let max_varint = sys::DWNX_MAX_VARINT;
@@ -135,17 +150,25 @@ impl TransportParameters {
             )));
         }
 
-        if self.max_record_size > max_varint {
+        // dwnx の conn_new はアプリケーションが指定した max_record_size を
+        // 既定値へ強制する (dwnx の lib/dwnx_conn.c にある "We do not let
+        // application increase max record size.")。既定値以外を指定しても
+        // 黙って無視されるため、設定の誤りに気づけるよう拒否する。
+        let default_max_record_size = u64::from(sys::DWNX_DEFAULT_MAX_RECORD_SIZE);
+        if self.max_record_size != default_max_record_size {
             return Err(Error::invalid_argument(format!(
-                "max_record_size must not exceed DWNX_MAX_VARINT ({max_varint})"
+                "max_record_size must be DWNX_DEFAULT_MAX_RECORD_SIZE ({default_max_record_size}); dwnx ignores other values"
             )));
         }
-        // ピアが送る Record を受け取るバッファの大きさが既定値を下回ると、
-        // dwnx は Record を組み立てられない
-        if self.max_record_size < u64::from(sys::DWNX_DEFAULT_MAX_RECORD_SIZE) {
+
+        // max_datagram_frame_size は 0 より大きい場合だけ可変長整数として
+        // 符号化される (dwnx の lib/dwnx_transport_params.c を参照)。ほかの
+        // initial_max_* と同じく DWNX_MAX_VARINT を超えられない。dwnx の
+        // conn_new には assert が無いが、符号化の dwnx_put_uvarint が assert で
+        // プロセスを abort させるため、Rust 側で先に検査する。
+        if self.max_datagram_frame_size > max_varint {
             return Err(Error::invalid_argument(format!(
-                "max_record_size must be at least DWNX_DEFAULT_MAX_RECORD_SIZE ({})",
-                sys::DWNX_DEFAULT_MAX_RECORD_SIZE
+                "max_datagram_frame_size must not exceed DWNX_MAX_VARINT ({max_varint})"
             )));
         }
 
@@ -163,6 +186,7 @@ impl TransportParameters {
             initial_max_streams_uni: self.initial_max_streams_uni,
             max_idle_timeout: self.max_idle_timeout,
             max_record_size: self.max_record_size,
+            max_datagram_frame_size: self.max_datagram_frame_size,
         }
     }
 
@@ -177,6 +201,7 @@ impl TransportParameters {
             initial_max_streams_uni: params.initial_max_streams_uni,
             max_idle_timeout: params.max_idle_timeout,
             max_record_size: params.max_record_size,
+            max_datagram_frame_size: params.max_datagram_frame_size,
         }
     }
 }

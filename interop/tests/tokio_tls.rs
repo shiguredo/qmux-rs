@@ -35,6 +35,8 @@ fn qmux_config() -> QmuxConfig {
         initial_max_stream_data_uni: 16 * 1024,
         initial_max_streams_bidi: 8,
         initial_max_streams_uni: 8,
+        // DATAGRAM 拡張を有効にする (RFC 9221 Section 3)
+        max_datagram_frame_size: Some(65535),
         ..QmuxConfig::default()
     }
 }
@@ -49,6 +51,8 @@ fn dwnx_config() -> DwnxTransportParameters {
         initial_max_streams_bidi: 8,
         initial_max_streams_uni: 8,
         max_idle_timeout: 30_000_000_000,
+        // DATAGRAM 拡張を有効にする (RFC 9221 Section 3)
+        max_datagram_frame_size: 65535,
         ..DwnxTransportParameters::default()
     }
 }
@@ -238,5 +242,204 @@ async fn qmux_client_dwnx_server_over_tls() {
     let echoed = with_guard(read_all_qmux(&mut recv)).await;
     assert_eq!(echoed, b"hello from qmux", "エコーが一致すること");
 
+    with_guard(server).await.expect("サーバータスクが終了する");
+}
+
+#[tokio::test]
+async fn datagram_roundtrip_over_tls() {
+    // aws-lc-sys をプロバイダとして使う
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // テスト用の CA と `localhost` のサーバー証明書を生成する
+    let certificates = generate_certificates();
+    let tls_server_config = server_config(&certificates);
+    let tls_client_config = client_config(certificates.ca_cert.clone());
+
+    let listener = with_guard(TcpListener::bind("127.0.0.1:0"))
+        .await
+        .expect("listen できる");
+    let addr = listener.local_addr().expect("addr を取得できる");
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = with_guard(listener.accept()).await.expect("accept できる");
+        let acceptor = TlsAcceptor::from(tls_server_config);
+        let tls = with_guard(acceptor.accept(tcp))
+            .await
+            .expect("TLS ハンドシェイクできる");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(ALPN),
+            "ALPN がネゴシエートされること"
+        );
+
+        let connection = tokio_dwnx::Connection::new(DwnxRole::Server, tls, dwnx_config())
+            .expect("QMux 接続を作成できる");
+
+        // クライアントからの DATAGRAM を受信し、エコーを返す
+        let data = with_guard(connection.recv_datagram())
+            .await
+            .expect("受信に失敗しない")
+            .expect("DATAGRAM が届く");
+        assert_eq!(data, b"hello datagram", "受信した DATAGRAM が一致すること");
+        with_guard(connection.send_datagram(&data))
+            .await
+            .expect("エコーの DATAGRAM を送れる");
+
+        // 空の DATAGRAM も往復させる (RFC 9221 Section 4)
+        let empty = with_guard(connection.recv_datagram())
+            .await
+            .expect("受信に失敗しない")
+            .expect("空の DATAGRAM が届く");
+        assert!(empty.is_empty(), "空の DATAGRAM が届くこと");
+        with_guard(connection.send_datagram(&empty))
+            .await
+            .expect("空の DATAGRAM を送れる");
+    });
+
+    let tcp = with_guard(TcpStream::connect(addr))
+        .await
+        .expect("接続できる");
+    let connector = TlsConnector::from(tls_client_config);
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost").expect("名前を変換できる");
+    let tls = with_guard(connector.connect(server_name, tcp))
+        .await
+        .expect("TLS ハンドシェイクできる");
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(ALPN),
+        "ALPN がネゴシエートされること"
+    );
+
+    let connection =
+        QmuxConnection::new(QmuxRole::Client, tls, qmux_config()).expect("QMux 接続を作成できる");
+
+    // tokio-qmux クライアントから tokio-dwnx サーバーへ DATAGRAM が届くこと
+    with_guard(connection.send_datagram(b"hello datagram"))
+        .await
+        .expect("DATAGRAM を送れる");
+    let echoed = with_guard(connection.recv_datagram())
+        .await
+        .expect("受信に失敗しない")
+        .expect("エコーの DATAGRAM が届く");
+    assert_eq!(
+        echoed, b"hello datagram",
+        "tokio-dwnx がエコーした DATAGRAM が一致すること"
+    );
+
+    // 空の DATAGRAM も往復すること
+    with_guard(connection.send_datagram(b""))
+        .await
+        .expect("空の DATAGRAM を送れる");
+    let echoed = with_guard(connection.recv_datagram())
+        .await
+        .expect("受信に失敗しない")
+        .expect("空のエコーの DATAGRAM が届く");
+    assert!(echoed.is_empty(), "空の DATAGRAM がエコーされること");
+
+    with_guard(server).await.expect("サーバータスクが終了する");
+}
+
+#[tokio::test]
+async fn dwnx_client_qmux_server_over_tls() {
+    // 逆方向の役割の組み合わせ: tokio-dwnx クライアントから tokio-qmux サーバーへ
+    // TLS で接続する。tokio-dwnx の open / finish / close (linger) と tokio-qmux の
+    // accept の組み合わせを、ストリームと DATAGRAM の両方で検証する。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let certificates = generate_certificates();
+    let tls_server_config = server_config(&certificates);
+    let tls_client_config = client_config(certificates.ca_cert.clone());
+
+    let listener = with_guard(TcpListener::bind("127.0.0.1:0"))
+        .await
+        .expect("listen できる");
+    let addr = listener.local_addr().expect("addr を取得できる");
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = with_guard(listener.accept()).await.expect("accept できる");
+        let acceptor = TlsAcceptor::from(tls_server_config);
+        let tls = with_guard(acceptor.accept(tcp))
+            .await
+            .expect("TLS ハンドシェイクできる");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(ALPN),
+            "ALPN がネゴシエートされること"
+        );
+
+        let connection = QmuxConnection::new(QmuxRole::Server, tls, qmux_config())
+            .expect("QMux 接続を作成できる");
+        let (mut send, mut recv) = with_guard(connection.accept_bidirectional())
+            .await
+            .expect("accept に失敗しない")
+            .expect("ストリームが届く");
+
+        let data = with_guard(read_all_qmux(&mut recv)).await;
+        assert_eq!(data, b"hello from dwnx", "受信データが一致すること");
+
+        // エコーを返す
+        with_guard(send.write(&data)).await.expect("書き込める");
+        with_guard(send.finish()).await.expect("FIN を送れる");
+
+        // DATAGRAM も逆方向に往復させる
+        let datagram = with_guard(connection.recv_datagram())
+            .await
+            .expect("受信に失敗しない")
+            .expect("DATAGRAM が届く");
+        assert_eq!(
+            datagram, b"dwnx datagram",
+            "受信した DATAGRAM が一致すること"
+        );
+        with_guard(connection.send_datagram(&datagram))
+            .await
+            .expect("DATAGRAM を送れる");
+    });
+
+    let tcp = with_guard(TcpStream::connect(addr))
+        .await
+        .expect("接続できる");
+    let connector = TlsConnector::from(tls_client_config);
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost").expect("名前を変換できる");
+    let tls = with_guard(connector.connect(server_name, tcp))
+        .await
+        .expect("TLS ハンドシェイクできる");
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(ALPN),
+        "ALPN がネゴシエートされること"
+    );
+
+    let connection = tokio_dwnx::Connection::new(DwnxRole::Client, tls, dwnx_config())
+        .expect("QMux 接続を作成できる");
+
+    // tokio-dwnx クライアントから tokio-qmux サーバーへ双方向ストリームで送る
+    let (mut send, mut recv) = with_guard(connection.open_bidirectional())
+        .await
+        .expect("ストリームを開ける");
+    with_guard(send.write(b"hello from dwnx"))
+        .await
+        .expect("書き込める");
+    with_guard(send.finish()).await.expect("FIN を送れる");
+
+    let echoed = with_guard(read_all_dwnx(&mut recv)).await;
+    assert_eq!(echoed, b"hello from dwnx", "エコーが一致すること");
+
+    // DATAGRAM も往復させる
+    with_guard(connection.send_datagram(b"dwnx datagram"))
+        .await
+        .expect("DATAGRAM を送れる");
+    let echoed = with_guard(connection.recv_datagram())
+        .await
+        .expect("受信に失敗しない")
+        .expect("エコーの DATAGRAM が届く");
+    assert_eq!(
+        echoed, b"dwnx datagram",
+        "tokio-qmux がエコーした DATAGRAM が一致すること"
+    );
+
+    // tokio-dwnx の close (linger) でサーバーが接続の終了を観測すること
+    connection.close(0, "done");
     with_guard(server).await.expect("サーバータスクが終了する");
 }

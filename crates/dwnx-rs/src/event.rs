@@ -48,6 +48,14 @@ pub enum Event {
         /// アプリケーションエラーコード
         error_code: u64,
     },
+    /// DATAGRAM を受信した (RFC 9221)
+    ///
+    /// dwnx は DATAGRAM を部分的に届けることがあるが、dwnx-rs が全体を
+    /// 組み立てられた時点でこのイベントを 1 つ積む。空の DATAGRAM も届く。
+    Datagram {
+        /// 受信した DATAGRAM のデータ
+        data: Vec<u8>,
+    },
     /// 接続が閉じた
     ///
     /// アイドルタイムアウトの満了、または下位トランスポートの終了で発生する。

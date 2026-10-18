@@ -20,6 +20,26 @@ use crate::event::Event;
 struct Sink {
     /// コールバックが通知したイベント
     events: RefCell<VecDeque<Event>>,
+    /// 部分配送されている DATAGRAM の組み立て状態
+    datagram: RefCell<DatagramAssembly>,
+}
+
+/// 部分配送されている DATAGRAM の組み立て状態
+///
+/// dwnx の `recv_datagram` コールバックは、1 つの DATAGRAM を複数のチャンクに
+/// 分割して通知することがある (dwnx の `lib/dwnx_conn.c` の
+/// `DWNX_RECORD_READ_STATE_DATAGRAM_DATA` を参照)。チャンクは同じ DATAGRAM の
+/// 先頭からの位置 `offset` と全体長 `dgramlen` を伴うため、接続ごとにこの
+/// バッファへ連結して 1 つのイベントに組み立てる。
+#[derive(Debug, Default)]
+struct DatagramAssembly {
+    /// 組み立て中のデータ
+    data: Vec<u8>,
+    /// 組み立て中の DATAGRAM の全体長
+    ///
+    /// 最初のチャンクで通知された `dgramlen` を保持し、以降のチャンクの
+    /// `dgramlen` と一致することを検査する。
+    dgramlen: usize,
 }
 
 thread_local! {
@@ -44,6 +64,29 @@ struct PendingWrite {
     fin: bool,
 }
 
+/// 送信待ちの DATAGRAM
+#[derive(Debug)]
+enum PendingDatagram {
+    /// 送信するデータ
+    Data(Vec<u8>),
+    /// 送信できないことが確定している DATAGRAM
+    ///
+    /// フレームがローカルの Record 容量に収まらない場合に積む。データの代わりに
+    /// 失敗の理由をキューへ積むことで、先に積んだ DATAGRAM の完了通知との順序を
+    /// 保ったまま [`DatagramEvent::Failed`] を通知できる。
+    Rejected(Error),
+}
+
+/// 1 つの Record に収められる DATAGRAM フレームの最大長
+///
+/// dwnx の Record の符号化器は、送信バッファの先頭 2 バイトを Record 長の
+/// 可変長整数のために空ける (dwnx の `lib/dwnx_qre.c` の `dwnx_qre_start` と
+/// `lib/dwnx_qre.h` の `DWNX_QRE_RECORDLEN_SIZE`)。そのためフレームに使えるのは
+/// `dest.len() - 2` バイトである。dwnx は Record に収まらない DATAGRAM フレームの
+/// `DWNX_ERR_NOBUF` を握りつぶすため (dwnx の `lib/dwnx_conn.c` の
+/// `dwnx_conn_write_vmsg`)、dwnx-rs 側で事前に検査する必要がある。
+const DWNX_QRE_RECORDLEN_SIZE: u64 = 2;
+
 /// 送信待ちの書き込みの結果
 ///
 /// [`Connection::write`] で積んだ書き込みは [`Connection::poll_transmit`] の中で
@@ -64,6 +107,47 @@ pub enum WriteEvent {
     },
 }
 
+/// 送信待ちの DATAGRAM の結果
+///
+/// [`Connection::send_datagram`] で積んだ DATAGRAM は
+/// [`Connection::poll_transmit`] の中で dwnx へ渡される。収録と失敗は
+/// [`Connection::poll_datagram_event`] で取り出す。ストリームの
+/// [`WriteEvent`] と同じ設計である。
+#[derive(Debug)]
+pub enum DatagramEvent {
+    /// dwnx が DATAGRAM を Record に収めた
+    ///
+    /// Record を書き出し終えたことは [`Connection::poll_transmit`] の呼び出し側が
+    /// 下位トランスポートへの書き込みで確認する (ストリームの
+    /// [`WriteEvent::Written`] と同じ扱い)。
+    Accepted,
+    /// DATAGRAM を送信できなかった
+    ///
+    /// ピアが DATAGRAM 拡張を広告していない場合 (`DWNX_ERR_INVALID_STATE`) と、
+    /// フレームがピアの `max_datagram_frame_size` を超える場合
+    /// (`DWNX_ERR_INVALID_ARGUMENT`) に発生する。どちらの場合もこの DATAGRAM
+    /// だけが失敗し、接続は閉じない。それ以外のエラーでは接続全体を閉じるため、
+    /// このイベントではなく [`Connection::poll_transmit`] の [`Error`] で通知する。
+    Failed {
+        /// 失敗の理由
+        error: Error,
+    },
+}
+
+/// dwnx への Record 書き込み 1 回分の結果
+///
+/// [`Connection::poll_transmit`] は 1 つの Record を完成させるまで
+/// `dwnx_conn_write_*` を呼び続ける。その 1 回の呼び出しの結果を表す。
+#[derive(Debug)]
+enum WriteStep {
+    /// Record が完成した (書き出したバイト数)
+    Record(usize),
+    /// 同じ Record に続けて書ける (`DWNX_ERR_WRITE_MORE`)
+    Continue,
+    /// 送るものが無い (戻り値 0)
+    Idle,
+}
+
 /// dwnx 接続
 ///
 /// dwnx の `dwnx_conn` を所有し、Sans I/O の操作を提供する。1 つの接続は
@@ -79,6 +163,15 @@ pub struct Connection {
     pending_writes: VecDeque<PendingWrite>,
     /// 送信待ちの書き込みの結果
     write_events: VecDeque<WriteEvent>,
+    /// 送信待ちの DATAGRAM
+    pending_datagrams: VecDeque<PendingDatagram>,
+    /// 送信待ちの DATAGRAM の結果
+    datagram_events: VecDeque<DatagramEvent>,
+    /// 次の Record でストリームより DATAGRAM を優先するかどうか
+    ///
+    /// ストリームと DATAGRAM の両方が送信待ちの間、Record を組み立てるたびに
+    /// 入れ替えて、片方の完了通知が永遠に届かない飢餓状態を避ける。
+    prefer_datagram: bool,
     /// 送信待ちの CONNECTION_CLOSE
     close_record: Option<Vec<u8>>,
     /// 接続が閉じたかどうか
@@ -169,6 +262,9 @@ impl Connection {
             dest: vec![0u8; sys::DWNX_DEFAULT_MAX_RECORD_SIZE as usize],
             pending_writes: VecDeque::new(),
             write_events: VecDeque::new(),
+            pending_datagrams: VecDeque::new(),
+            datagram_events: VecDeque::new(),
+            prefer_datagram: false,
             close_record: None,
             closed: false,
         })
@@ -234,6 +330,61 @@ impl Connection {
         self.write_events.pop_front()
     }
 
+    /// DATAGRAM を送信する (内部バッファへ積む)
+    ///
+    /// 実際の Record 生成は [`Connection::poll_transmit`] が行う。空の DATAGRAM も
+    /// 送信できる (RFC 9221 Section 4)。積んだ DATAGRAM の収録と失敗は
+    /// [`Connection::poll_datagram_event`] で通知する。
+    ///
+    /// ピアが DATAGRAM 拡張を広告していない場合と、フレームがピアの
+    /// `max_datagram_frame_size` を超える場合は、この時点ではエラーにせず
+    /// [`DatagramEvent::Failed`] として通知する。dwnx が送信時に検査して
+    /// `DWNX_ERR_INVALID_STATE` / `DWNX_ERR_INVALID_ARGUMENT` を返すためであり、
+    /// どちらも接続は閉じない。
+    ///
+    /// フレーム (タイプと Length を含む) がローカルの Record 容量に収まらない
+    /// 場合も [`DatagramEvent::Failed`] として通知する。この場合は dwnx が
+    /// `DWNX_ERR_NOBUF` を握りつぶして何も返さないため、送信待ちに積まずに
+    /// 失敗を確定させる。
+    ///
+    /// 戻り値は送信待ちのキューに積んだかどうかである。接続が閉じている場合は
+    /// 送信されないため false を返す。[`Connection::close`] を呼んだ後に積んだ
+    /// DATAGRAM も、CONNECTION_CLOSE が優先されるため送信されない。
+    pub fn send_datagram(&mut self, data: &[u8]) -> bool {
+        if self.closed {
+            return false;
+        }
+
+        // DATAGRAM フレームはタイプ (1 バイト) と Length (可変長整数)、ペイロード
+        // からなる。フレーム全体が Record に収まらない場合は dwnx が
+        // DWNX_ERR_NOBUF を握りつぶすため、成功も失敗も通知されず送信待ちが
+        // 永久に残ってしまう。ここで事前に検査し、失敗を確定させる。
+        let frame_len = datagram_frame_len(data.len());
+        let capacity = (self.dest.len() as u64).saturating_sub(DWNX_QRE_RECORDLEN_SIZE);
+        if frame_len > capacity {
+            // 先に積んだ DATAGRAM との完了通知の順序を保つため、データの代わりに
+            // 失敗をキューへ積む
+            self.pending_datagrams
+                .push_back(PendingDatagram::Rejected(Error::invalid_argument(
+                    format!(
+                        "datagram frame of {frame_len} bytes exceeds the record buffer capacity {capacity}"
+                    ),
+                )));
+            return true;
+        }
+
+        self.pending_datagrams
+            .push_back(PendingDatagram::Data(data.to_vec()));
+        true
+    }
+
+    /// 送信待ちの DATAGRAM の結果を 1 つ取り出す
+    ///
+    /// [`Connection::send_datagram`] で積んだ順に取り出せる。
+    pub fn poll_datagram_event(&mut self) -> Option<DatagramEvent> {
+        self.datagram_events.pop_front()
+    }
+
     /// 送信する Record を 1 つ `out` へ書き出す
     ///
     /// 書き出した場合は true を返す。
@@ -241,9 +392,8 @@ impl Connection {
     /// # エラー
     ///
     /// dwnx が継続できないエラーを返した場合に [`Error`] を返す。dwnx.h の
-    /// `dwnx_conn_writev_stream` の契約では、`DWNX_ERR_WRITE_MORE` /
-    /// `DWNX_ERR_STREAM_DATA_BLOCKED` / `DWNX_ERR_STREAM_SHUT_WR` 以外の負の
-    /// エラーで接続を閉じることになっている。
+    /// `dwnx_conn_writev_stream` / `dwnx_conn_writev_datagram` の契約では、
+    /// それぞれが継続を許すエラー以外の負のエラーで接続を閉じることになっている。
     pub fn poll_transmit(&mut self, out: &mut Vec<u8>, now: u64) -> Result<bool, Error> {
         out.clear();
 
@@ -258,18 +408,90 @@ impl Connection {
         }
 
         loop {
-            let front = self.pending_writes.front();
-            let (stream_id, data_ptr, data_len, flags) = match front {
-                Some(write) => {
-                    let remaining = &write.data[write.sent..];
-                    let flags = if write.fin {
-                        sys::DWNX_WRITE_STREAM_FLAG_FIN
-                    } else {
-                        sys::DWNX_WRITE_STREAM_FLAG_NONE
-                    };
-                    (write.stream_id, remaining.as_ptr(), remaining.len(), flags)
+            // ストリームと DATAGRAM の両方が送信待ちの間は、Record を組み立てる
+            // たびに優先する側を入れ替える。dwnx はどちらも同じ Record に詰められる
+            // が、片方だけを優先し続けると、アプリケーションが継続的に書き込んで
+            // いる間もう片方の完了通知が永遠に届かなくなる。
+            let has_stream = !self.pending_writes.is_empty();
+            let has_datagram = !self.pending_datagrams.is_empty();
+            let write_datagram = has_datagram && (!has_stream || self.prefer_datagram);
+            if has_stream && has_datagram {
+                self.prefer_datagram = !self.prefer_datagram;
+            }
+
+            let step = if write_datagram {
+                self.write_datagram(now)?
+            } else {
+                self.write_stream(now)?
+            };
+
+            match step {
+                WriteStep::Record(len) => {
+                    out.extend_from_slice(&self.dest[..len]);
+                    return Ok(true);
                 }
-                None => (-1i64, ptr::null(), 0usize, sys::DWNX_WRITE_STREAM_FLAG_NONE),
+                // DWNX_ERR_WRITE_MORE は同じ Record に続けて書けることを表す
+                WriteStep::Continue => continue,
+                WriteStep::Idle => {
+                    // 選んだ側に送るものが無かった。もう片方が送信待ちなら試す。
+                    // 例えばフロー制御でブロックされたストリームがある間に
+                    // DATAGRAM を積んだ場合、ストリーム側の Idle で止まると
+                    // 次の起床まで DATAGRAM が送信されない。
+                    let other = if write_datagram {
+                        self.write_stream(now)?
+                    } else {
+                        self.write_datagram(now)?
+                    };
+                    match other {
+                        WriteStep::Record(len) => {
+                            out.extend_from_slice(&self.dest[..len]);
+                            return Ok(true);
+                        }
+                        WriteStep::Continue => continue,
+                        // どちらも送るものが無い
+                        WriteStep::Idle => return Ok(false),
+                    }
+                }
+            }
+        }
+    }
+
+    /// dwnx へストリームデータを書き込む 1 ステップ
+    ///
+    /// 送信待ちのストリームデータを先頭から順に試す。先頭のストリームがフロー
+    /// 制御でブロックされていても、後続のストリームや制御フレームが飢餓に
+    /// ならないようにするためである。同じストリームの送信順序は
+    /// `pending_writes` の順序で保たれる。
+    ///
+    /// この Record に書けるストリームデータが無い場合は、
+    /// `dwnx_conn_write_record` で開始済みの Record を確定する。dwnx.h の
+    /// 説明のとおり、`DWNX_ERR_WRITE_MORE` / `DWNX_ERR_STREAM_DATA_BLOCKED` の
+    /// 後はこの関数で Record を確定できる。開始済みの Record を確定せずに
+    /// 戻ると、同じ Record に収めた DATAGRAM が送信されないまま残る。
+    fn write_stream(&mut self, now: u64) -> Result<WriteStep, Error> {
+        // この Record で進捗できなかったストリーム ID
+        //
+        // 同じストリームの後続の書き込みを先に送ると順序が入れ替わるため、
+        // 進捗できなかったストリームは今回の Record では試さない。
+        let mut blocked: Vec<i64> = Vec::new();
+
+        let mut index = 0;
+        while index < self.pending_writes.len() {
+            let stream_id = self.pending_writes[index].stream_id;
+            if blocked.contains(&stream_id) {
+                index += 1;
+                continue;
+            }
+
+            let (data_ptr, data_len, flags) = {
+                let write = &self.pending_writes[index];
+                let remaining = &write.data[write.sent..];
+                let flags = if write.fin {
+                    sys::DWNX_WRITE_STREAM_FLAG_FIN
+                } else {
+                    sys::DWNX_WRITE_STREAM_FLAG_NONE
+                };
+                (remaining.as_ptr(), remaining.len(), flags)
             };
 
             let dest_ptr = self.dest.as_mut_ptr();
@@ -291,41 +513,148 @@ impl Connection {
 
             if rv >= 0 {
                 if rv == 0 {
-                    return Ok(false);
+                    // 送るものが無い。制御フレームの Record も無い
+                    break;
                 }
-                if stream_id != -1 {
-                    self.finish_write(stream_id, pdatalen);
-                }
-                out.extend_from_slice(&self.dest[..rv as usize]);
-                return Ok(true);
+                self.finish_write(index, pdatalen);
+                return Ok(WriteStep::Record(rv as usize));
             }
 
             match rv as i32 {
                 sys::DWNX_ERR_WRITE_MORE => {
                     let accepted = pdatalen.max(0) as usize;
-                    // STREAM フレームが 1 バイトも書けていない場合は無限ループを避ける
-                    if stream_id != -1 && accepted == 0 && data_len > 0 {
-                        return Ok(false);
+                    // STREAM フレームが 1 バイトも書けていない場合は、この
+                    // ストリームを今回の Record では後回しにして次を試す
+                    if accepted == 0 && data_len > 0 {
+                        blocked.push(stream_id);
+                        index += 1;
+                        continue;
                     }
-                    if stream_id != -1 {
-                        self.finish_write(stream_id, pdatalen);
-                    }
+                    self.finish_write(index, pdatalen);
+                    return Ok(WriteStep::Continue);
+                }
+                sys::DWNX_ERR_STREAM_DATA_BLOCKED => {
+                    // フロー制御で送れない。後続のストリームを試す
+                    blocked.push(stream_id);
+                    index += 1;
                     continue;
                 }
-                sys::DWNX_ERR_STREAM_DATA_BLOCKED => return Ok(false),
                 code @ sys::DWNX_ERR_STREAM_SHUT_WR => {
                     // 送信側が閉じているため、この書き込みは送れない。dwnx は
                     // 継続してよいエラーとして扱うため、失敗を通知して次へ進む。
-                    self.fail_write(code);
+                    self.fail_write(index, code);
                     continue;
                 }
                 sys::DWNX_ERR_STREAM_NOT_FOUND => {
-                    // ストリームが存在しないため、この書き込みは送れない。dwnx.h の
-                    // 契約では継続できないエラーであり、接続を閉じる必要がある。
-                    self.fail_write(sys::DWNX_ERR_STREAM_NOT_FOUND);
+                    // ストリームが存在しないため、この書き込みは送れない。dwnx.h
+                    // の契約では継続できないエラーであり、接続を閉じる必要がある。
+                    self.fail_write(index, sys::DWNX_ERR_STREAM_NOT_FOUND);
                     return Err(Error::from_code(sys::DWNX_ERR_STREAM_NOT_FOUND));
                 }
                 other => return Err(Error::from_code(other)),
+            }
+        }
+
+        // ストリームデータを書けない場合でも、開始済みの Record を確定するか、
+        // 制御フレームだけの Record を組み立てる。
+        let rv = unsafe {
+            sys::dwnx_conn_write_record(self.raw, self.dest.as_mut_ptr(), self.dest.len(), now)
+        };
+        if rv >= 0 {
+            if rv == 0 {
+                Ok(WriteStep::Idle)
+            } else {
+                Ok(WriteStep::Record(rv as usize))
+            }
+        } else {
+            Err(Error::from_code(rv as i32))
+        }
+    }
+
+    /// dwnx へ DATAGRAM を書き込む 1 ステップ
+    ///
+    /// 送信待ちの DATAGRAM を 1 つ書き込む。dwnx.h の
+    /// `dwnx_conn_writev_datagram` の契約に従い、戻り値と `paccepted` の
+    /// 組み合わせで後続の処理を決める。
+    fn write_datagram(&mut self, now: u64) -> Result<WriteStep, Error> {
+        // 送信できないことが確定している DATAGRAM は、データを送らずに失敗を
+        // 通知する。先に積んだ DATAGRAM の完了通知との順序はキューの順序で保つ。
+        if matches!(
+            self.pending_datagrams.front(),
+            Some(PendingDatagram::Rejected(_))
+        ) {
+            if let Some(PendingDatagram::Rejected(error)) = self.pending_datagrams.pop_front() {
+                self.datagram_events
+                    .push_back(DatagramEvent::Failed { error });
+            }
+            return Ok(WriteStep::Continue);
+        }
+
+        let Some(PendingDatagram::Data(data)) = self.pending_datagrams.front() else {
+            // 送信待ちの DATAGRAM が無い場合は制御フレームだけの Record を組み立てる
+            return self.write_stream(now);
+        };
+        let (data_ptr, data_len) = (data.as_ptr(), data.len());
+
+        let mut paccepted: core::ffi::c_int = 0;
+        let rv = unsafe {
+            sys::dwnx_conn_write_datagram(
+                self.raw,
+                self.dest.as_mut_ptr(),
+                self.dest.len(),
+                &mut paccepted,
+                sys::DWNX_WRITE_DATAGRAM_FLAG_NONE,
+                data_ptr,
+                data_len,
+                now,
+            )
+        };
+
+        if rv >= 0 {
+            if rv == 0 {
+                return Ok(WriteStep::Idle);
+            }
+            // 戻り値が正でも accepted が 0 の場合は、他のフレームが Record を
+            // 占めており DATAGRAM がまだ書かれていない。キューに残して次の
+            // Record で再試行する (dwnx.h の `dwnx_conn_writev_datagram` を参照)。
+            if paccepted == 0 {
+                return Ok(WriteStep::Record(rv as usize));
+            }
+            self.pending_datagrams.pop_front();
+            self.datagram_events.push_back(DatagramEvent::Accepted);
+            return Ok(WriteStep::Record(rv as usize));
+        }
+
+        match rv as i32 {
+            sys::DWNX_ERR_WRITE_MORE => {
+                if paccepted == 0 {
+                    // dwnx は DATAGRAM を符号化できた場合にだけ WRITE_MORE を
+                    // 返す (dwnx の lib/dwnx_conn.c の dwnx_conn_write_vmsg)。
+                    // そのためここには到達しないが、無限ループを避けるための
+                    // 進捗ガードを置く。
+                    return Ok(WriteStep::Idle);
+                }
+                self.pending_datagrams.pop_front();
+                self.datagram_events.push_back(DatagramEvent::Accepted);
+                Ok(WriteStep::Continue)
+            }
+            // ピアが DATAGRAM 拡張を広告していない、または DATAGRAM がピアの
+            // max_datagram_frame_size を超える。どちらもこの DATAGRAM の失敗と
+            // して通知し、接続は閉じない (dwnx.h の
+            // `dwnx_conn_writev_datagram` の契約)。
+            code @ (sys::DWNX_ERR_INVALID_STATE | sys::DWNX_ERR_INVALID_ARGUMENT) => {
+                self.pending_datagrams.pop_front();
+                self.datagram_events.push_back(DatagramEvent::Failed {
+                    error: Error::from_code(code),
+                });
+                Ok(WriteStep::Continue)
+            }
+            // それ以外の負のエラーでは接続を閉じる。この DATAGRAM の失敗は
+            // 通知せず (接続の終了は呼び出し側が poll_transmit のエラーで知る)、
+            // キューからも取り除く。
+            other => {
+                self.pending_datagrams.pop_front();
+                Err(Error::from_code(other))
             }
         }
     }
@@ -334,25 +663,23 @@ impl Connection {
     ///
     /// dwnx は渡したデータをすべて STREAM フレームに収めた場合にのみ FIN を
     /// 立てるため、すべて受け付けた時点でその書き込みは完了である。
-    fn finish_write(&mut self, stream_id: i64, pdatalen: sys::dwnx_ssize) {
-        let Some(write) = self.pending_writes.front_mut() else {
+    fn finish_write(&mut self, index: usize, pdatalen: sys::dwnx_ssize) {
+        let Some(write) = self.pending_writes.get_mut(index) else {
             return;
         };
-        if write.stream_id != stream_id {
-            return;
-        }
         let accepted = pdatalen.max(0) as usize;
         write.sent = (write.sent + accepted).min(write.data.len());
         if write.sent >= write.data.len() {
-            self.pending_writes.pop_front();
+            let stream_id = write.stream_id;
+            self.pending_writes.remove(index);
             self.write_events
                 .push_back(WriteEvent::Written { stream_id });
         }
     }
 
     /// 送信できなかった書き込みを捨てて失敗を通知する
-    fn fail_write(&mut self, code: i32) {
-        let Some(write) = self.pending_writes.pop_front() else {
+    fn fail_write(&mut self, index: usize, code: i32) {
+        let Some(write) = self.pending_writes.remove(index) else {
             return;
         };
         self.write_events.push_back(WriteEvent::Failed {
@@ -558,6 +885,33 @@ fn floor_char_boundary(bytes: &[u8], len: usize) -> usize {
     len
 }
 
+/// DATAGRAM フレーム全体のバイト数を返す
+///
+/// フレームはタイプ (1 バイト。dwnx は常に Length 付きの
+/// `DWNX_FRAME_DATAGRAM_LEN` を使う) と Length (可変長整数)、ペイロードからなる
+/// (RFC 9221 Section 4、dwnx の `lib/dwnx_frame.c` の
+/// `dwnx_frame_datagram_framelen`)。
+fn datagram_frame_len(payload_len: usize) -> u64 {
+    let payload_len = payload_len as u64;
+    1u64.saturating_add(varint_len(payload_len))
+        .saturating_add(payload_len)
+}
+
+/// 可変長整数を符号化したときのバイト数を返す
+///
+/// RFC 9000 Section 16 の可変長整数は先頭 2 ビットで長さが決まる。
+fn varint_len(value: u64) -> u64 {
+    if value < 64 {
+        1
+    } else if value < 16384 {
+        2
+    } else if value < 1 << 30 {
+        4
+    } else {
+        8
+    }
+}
+
 /// dwnx のコールバック一式を組み立てる
 ///
 /// dwnx.h の説明のとおり `rand` 以外のコールバックは省略できる。使わない
@@ -583,6 +937,8 @@ fn callbacks() -> sys::dwnx_callbacks {
         extend_max_remote_streams_uni: None,
         // 書き込みの完了は WriteEvent で通知する。
         write_stream_data_offset: None,
+        // DATAGRAM の受信は Event::Datagram で通知する。
+        recv_datagram: Some(recv_datagram),
     }
 }
 
@@ -646,6 +1002,62 @@ unsafe extern "C" fn recv_stream_data(
             fin,
             data,
         });
+    0
+}
+
+/// DATAGRAM の受信 (全体または部分)
+///
+/// dwnx は 1 つの DATAGRAM を複数のチャンクに分割して通知することがある
+/// (入力バイト列がフレームの途中で区切られた場合)。チャンクを連結して全体を
+/// 組み立てられた時点で [`Event::Datagram`] を 1 つ積む。
+///
+/// `fin` はこのチャンクが DATAGRAM の最後かどうか、`dgramlen` は DATAGRAM 全体の
+/// 長さ、`offset` は DATAGRAM の先頭からのこのチャンクの位置である
+/// (dwnx.h の `dwnx_recv_datagram` を参照)。
+unsafe extern "C" fn recv_datagram(
+    _conn: *mut sys::dwnx_conn,
+    fin: core::ffi::c_int,
+    dgramlen: usize,
+    offset: usize,
+    data: *const u8,
+    datalen: usize,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    let sink = unsafe { sink(user_data) };
+    let mut assembly = sink.datagram.borrow_mut();
+
+    if offset == 0 {
+        // 新しい DATAGRAM の先頭である。前回の組み立てが残っていれば捨てる
+        assembly.data.clear();
+        assembly.dgramlen = dgramlen;
+    } else if offset != assembly.data.len() || dgramlen != assembly.dgramlen {
+        // dwnx 自身がフレームの読み取り位置を管理しており、offset は
+        // dgramlen - field_left として求まる (dwnx の lib/dwnx_conn.c の
+        // DWNX_RECORD_READ_STATE_DATAGRAM_DATA)。そのため offset の連続性と
+        // dgramlen の一致は dwnx が保証しており、ここに来るのは内部状態が
+        // 壊れた場合だけである。壊れたデータをアプリケーションへ渡すより、
+        // この DATAGRAM を捨てる方が安全である。コールバックの失敗
+        // (DWNX_ERR_CALLBACK_FAILURE による接続の close) にしないのは、
+        // フレーム自体は dwnx が検査済みであり、過剰なためである。
+        assembly.data.clear();
+        return 0;
+    }
+
+    if datalen > 0 {
+        let chunk = unsafe { core::slice::from_raw_parts(data, datalen) };
+        assembly.data.extend_from_slice(chunk);
+    }
+
+    if fin != 0 {
+        // 全体長と組み立てた長さが一致した場合だけ 1 つの DATAGRAM として通知する。
+        // ゼロ長 DATAGRAM は data が空で dgramlen も 0 のため、この検査で通る。
+        let complete = assembly.data.len() == assembly.dgramlen;
+        let data = core::mem::take(&mut assembly.data);
+        if complete {
+            sink.events.borrow_mut().push_back(Event::Datagram { data });
+        }
+    }
+
     0
 }
 

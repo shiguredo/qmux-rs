@@ -10,7 +10,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use dwnx_rs::TransportParameters;
-use dwnx_rs::{Connection as DwnxConnection, Event as DwnxEvent, WriteEvent};
+use dwnx_rs::{
+    Connection as DwnxConnection, DatagramEvent as DwnxDatagramEvent, Event as DwnxEvent,
+    WriteEvent,
+};
 
 use crate::Role;
 use crate::error::{Error, Result};
@@ -52,6 +55,18 @@ pub(crate) enum Command {
         /// アプリケーションエラーコード
         error_code: u64,
     },
+    /// DATAGRAM を送信する
+    ///
+    /// dwnx が Record に収め、下位トランスポートへ書き出し終えた時点で `ack` へ
+    /// 結果を返す。ピアが DATAGRAM 拡張を広告していない場合、フレームがピアの
+    /// `max_datagram_frame_size` を超える場合、またはローカルの Record 容量に
+    /// 収まらない場合は `ack` にエラーを返す。
+    Datagram {
+        /// 送信するデータ
+        data: Vec<u8>,
+        /// 送信完了または失敗を通知する応答チャネル
+        ack: oneshot::Sender<Result<()>>,
+    },
     /// 受信側がデータを取り出してチャネルに空きができたことを知らせる
     ///
     /// ドライバは配送待ちのイベントを保持しているため、通知が無いと
@@ -66,10 +81,16 @@ pub(crate) enum Command {
 
 impl Command {
     /// ピアのトランスポートパラメータの受信を待つ必要があるかどうか
+    ///
+    /// QMux はピアのトランスポートパラメータを受信するまで、ピアのフロー制御や
+    /// 拡張の対応状況に依存するフレームを送信してはならない
+    /// (draft-ietf-quic-qmux-02 Section 4.2)。DATAGRAM を送れるかどうかはピアの
+    /// `max_datagram_frame_size` で決まるため、DATAGRAM もこの対象である
+    /// (RFC 9221 Section 3)。
     fn requires_establishment(&self) -> bool {
         matches!(
             self,
-            Self::OpenBidirectional(_) | Self::OpenUnidirectional(_)
+            Self::OpenBidirectional(_) | Self::OpenUnidirectional(_) | Self::Datagram { .. }
         )
     }
 
@@ -86,6 +107,9 @@ impl Command {
                 let _ = reply.send(Err(error));
             }
             Self::Write { ack, .. } => {
+                let _ = ack.send(Err(error));
+            }
+            Self::Datagram { ack, .. } => {
                 let _ = ack.send(Err(error));
             }
             // 応答を待たないコマンドは捨ててよい
@@ -105,6 +129,13 @@ const COMMAND_CAPACITY: usize = 64;
 const CLOSE_CAPACITY: usize = 1;
 /// ピア起動ストリームの受け渡しチャネルの容量
 const ACCEPT_CAPACITY: usize = 16;
+/// 受信 DATAGRAM の保持数の上限
+///
+/// DATAGRAM はフロー制御されないため、アプリケーションが受け取らない間に
+/// 到着し続けてもメモリを使い続けないよう上限を設ける。あふれた DATAGRAM は
+/// 破棄し、個数を [`Connection::dropped_datagrams`] で観測できるようにする
+/// (draft-ietf-quic-qmux-02 Section 6、RFC 9221 Section 5.3)。
+const DATAGRAM_CAPACITY: usize = 64;
 /// ストリームごとの受信イベントチャネルの容量
 ///
 /// あふれたイベントはドライバの配送待ちキューに残り、クレジットを返さないことで
@@ -132,8 +163,9 @@ pub const DEFAULT_LINGER: Duration = Duration::from_secs(3);
 /// dwnx 接続
 ///
 /// 下位トランスポートを所有するドライバタスクを起動する。[`Connection`] を
-/// ドロップするとコマンドチャネルが閉じ、ドライバは下位トランスポートを閉じて
-/// 終了する。
+/// ドロップすると close 要求チャネルの送信側が閉じ、ドライバは下位トランスポートを
+/// 閉じて終了する。ストリームのハンドルが残っていても、ドライバ自身がコマンドの
+/// 送信側を保持するため、コマンドチャネルは閉じない。
 #[derive(Debug)]
 pub struct Connection {
     /// ドライバへのコマンド送信
@@ -150,6 +182,14 @@ pub struct Connection {
     ///
     /// `accept_bidirectional` と同じ理由で Mutex で包む。
     accept_unidirectional: Mutex<mpsc::Receiver<RecvStream>>,
+    /// 受信 DATAGRAM の受け取り
+    ///
+    /// `accept_bidirectional` と同じ理由で Mutex で包む。
+    datagrams: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// 破棄した受信 DATAGRAM の累計個数
+    ///
+    /// ドライバがチャネルの満杯で破棄した個数を watch で配る。
+    dropped_datagrams: watch::Receiver<u64>,
     /// ピアが要求した送信停止の受け取り
     ///
     /// `accept_bidirectional` と同じ理由で Mutex で包む。
@@ -172,7 +212,8 @@ impl Connection {
     ///
     /// `config` が dwnx の要求を満たさない場合と、dwnx 接続を作成できなかった場合に
     /// [`Error::Dwnx`] を返す。`TransportParameters::default()` はフロー制御の
-    /// クレジットが 0 のため、ストリームでデータを送る場合は明示的に設定すること。
+    /// クレジットが 0 で DATAGRAM も無効なため、ストリームや DATAGRAM を使う場合は
+    /// 明示的に設定すること。
     pub fn new<T>(role: Role, io: T, config: TransportParameters) -> Result<Self>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -208,8 +249,10 @@ impl Connection {
         let (close_request, close_request_rx) = mpsc::channel(CLOSE_CAPACITY);
         let (accept_bidirectional_tx, accept_bidirectional_rx) = mpsc::channel(ACCEPT_CAPACITY);
         let (accept_unidirectional_tx, accept_unidirectional_rx) = mpsc::channel(ACCEPT_CAPACITY);
+        let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_CAPACITY);
         let (stop_sending_tx, stop_sending_rx) = mpsc::channel(STOP_SENDING_CAPACITY);
         let (closed_tx, closed_rx) = watch::channel(false);
+        let (dropped_datagrams_tx, dropped_datagrams_rx) = watch::channel(0);
 
         // 送信できない設定はここでエラーにする。誤設定を最初の送信まで遅延させない。
         let connection = match role {
@@ -227,7 +270,9 @@ impl Connection {
             close_request_rx,
             accept_bidirectional_tx,
             accept_unidirectional_tx,
+            datagram_tx,
             stop_sending_tx,
+            dropped_datagrams_tx,
             closed_tx,
             recv_streams: BTreeMap::new(),
             pending_stream_events: VecDeque::new(),
@@ -235,8 +280,10 @@ impl Connection {
             pending_accept: VecDeque::new(),
             pending_commands: VecDeque::new(),
             pending_acks: VecDeque::new(),
+            pending_datagram_acks: VecDeque::new(),
             output: Vec::new(),
             written: 0,
+            datagram_drops: 0,
             established: false,
             local_close: false,
             write_shutdown: false,
@@ -253,6 +300,8 @@ impl Connection {
             close_request,
             accept_bidirectional: Mutex::new(accept_bidirectional_rx),
             accept_unidirectional: Mutex::new(accept_unidirectional_rx),
+            datagrams: Mutex::new(datagram_rx),
+            dropped_datagrams: dropped_datagrams_rx,
             stop_sending: Mutex::new(stop_sending_rx),
             closed: closed_rx,
         })
@@ -328,6 +377,73 @@ impl Connection {
         observed
     }
 
+    /// DATAGRAM を送信する
+    ///
+    /// dwnx が DATAGRAM を Record に収め、下位トランスポートへ書き出し終えるまで
+    /// 待つ。ピアが DATAGRAM 拡張を広告していない場合、フレームがピアの
+    /// `max_datagram_frame_size` を超える場合、またはフレームがローカルの Record
+    /// 容量 (`DWNX_DEFAULT_MAX_RECORD_SIZE` = 16382 バイト) に収まらない場合は
+    /// [`Error::Dwnx`] を返す (RFC 9221 Section 3、draft-ietf-quic-qmux-02
+    /// Section 9.1)。DATAGRAM は Record として届くが、受信側が速やかに
+    /// 受け取れない場合は破棄されうる。
+    pub async fn send_datagram(&self, data: &[u8]) -> Result<()> {
+        let (ack, receive) = oneshot::channel();
+        self.commands
+            .send(Command::Datagram {
+                data: data.to_vec(),
+                ack,
+            })
+            .await
+            .map_err(|_| Error::ConnectionClosed)?;
+        receive.await.map_err(|_| Error::ConnectionClosed)?
+    }
+
+    /// DATAGRAM を受信する
+    ///
+    /// 接続が閉じた場合は `Ok(None)` を返す。[`Self::accept_bidirectional`] と
+    /// 同様に `&self` で待てる。保持量には上限があり、あふれた DATAGRAM は
+    /// 破棄される。破棄された個数は [`Self::dropped_datagrams`] で観測できる。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// まだ受け取っていない DATAGRAM は失われない。
+    pub async fn recv_datagram(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.datagrams.lock().await.recv().await)
+    }
+
+    /// 到着済みの DATAGRAM をまとめて受け取る
+    ///
+    /// 1 件以上届くまで待ち、その時点で受け取れる分をすべてまとめて返す。返る
+    /// `Vec` は空にならない。接続が閉じた場合は `Ok(None)` を返す。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。最初の DATAGRAM を待っている間に future を
+    /// 破棄しても、まだ受け取っていない DATAGRAM は失われない。2 件目以降の取り出しは
+    /// await を挟まずに行うため、途中で破棄されることはない。
+    pub async fn recv_datagrams(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        let mut datagrams = self.datagrams.lock().await;
+        let Some(first) = datagrams.recv().await else {
+            return Ok(None);
+        };
+        let mut batch = vec![first];
+        while let Ok(datagram) = datagrams.try_recv() {
+            batch.push(datagram);
+        }
+        Ok(Some(batch))
+    }
+
+    /// 破棄した受信 DATAGRAM の累計個数を返す
+    ///
+    /// 受信チャネルの上限を超えて破棄した分を数える。DATAGRAM はフロー制御
+    /// されないため、アプリケーションが速やかに受け取れない場合は破棄されうる
+    /// (draft-ietf-quic-qmux-02 Section 6、RFC 9221 Section 5.3)。この値で
+    /// 取りこぼしを検知できる。
+    pub fn dropped_datagrams(&self) -> u64 {
+        *self.dropped_datagrams.borrow()
+    }
+
     /// 接続を閉じる
     ///
     /// CONNECTION_CLOSE が送信される。容量 1 の専用チャネルへ送るため、
@@ -392,8 +508,12 @@ struct Driver {
     accept_bidirectional_tx: mpsc::Sender<(SendStream, RecvStream)>,
     /// ピア起動の単方向ストリームの受け渡し
     accept_unidirectional_tx: mpsc::Sender<RecvStream>,
+    /// 受信 DATAGRAM の受け渡し
+    datagram_tx: mpsc::Sender<Vec<u8>>,
     /// 接続単位の STOP_SENDING 通知の受け渡し
     stop_sending_tx: mpsc::Sender<StopSendingObserved>,
+    /// 破棄した受信 DATAGRAM の累計個数の通知
+    dropped_datagrams_tx: watch::Sender<u64>,
     /// 接続が閉じたことの通知
     closed_tx: watch::Sender<bool>,
     /// ストリーム ID から受信イベント送信への対応
@@ -418,12 +538,19 @@ struct Driver {
     /// dwnx の送信待ちキューと同じ順序で並ぶ。完了と失敗は dwnx から
     /// [`WriteEvent`] として通知される。
     pending_acks: VecDeque<PendingAck>,
+    /// 応答を返していない DATAGRAM
+    ///
+    /// dwnx の DATAGRAM の送信待ちキューと同じ順序で並ぶ。完了と失敗は dwnx から
+    /// [`DwnxDatagramEvent`] として通知される。
+    pending_datagram_acks: VecDeque<oneshot::Sender<Result<()>>>,
     /// 下位トランスポートへ書き出す Record
     ///
     /// 書き出しの途中でも他の腕を動かせるよう、ドライバが保持する。
     output: Vec<u8>,
     /// `output` のうち書き出し済みのバイト数
     written: usize,
+    /// 受信チャネルが満杯で破棄した DATAGRAM の累計個数
+    datagram_drops: u64,
     /// ピアのトランスポートパラメータを受信済みかどうか
     established: bool,
     /// 自側から接続を閉じたかどうか
@@ -495,6 +622,7 @@ impl Driver {
 
         loop {
             self.process_events();
+            self.update_datagram_drops();
             self.retry_accept();
             self.retry_stream_events();
             self.retry_stop_sending();
@@ -520,11 +648,13 @@ impl Driver {
                     }
                 }
             }
-            // 書き出す Record が無い場合は、送れなかった書き込みの失敗だけが通知
-            // されている。応答を返さないとアプリケーションが待ち続けるため、ここで返す。
-            // 書き出しを終えた Record の応答は、書き切った時点 (書き込みの腕) で返す。
+            // 書き出す Record が無い場合は、送れなかった書き込みと DATAGRAM の
+            // 失敗だけが通知されている。応答を返さないとアプリケーションが待ち
+            // 続けるため、ここで返す。書き出しを終えた Record の応答は、書き切った
+            // 時点 (書き込みの腕) で返す。
             if self.written >= self.output.len() {
                 self.process_write_events();
+                self.process_datagram_events();
             }
             // Section 7.2 / 7.3: 接続が閉じたら下位トランスポートの送信側を graceful に
             // shutdown する。書きかけの Record があるうちは行わない。ピアが読み取って
@@ -594,10 +724,11 @@ impl Driver {
                 }
                 Wake::Write(Ok(len)) => {
                     self.written += len;
-                    // Record を書き切った時点で、その Record に含まれる書き込みへ
-                    // 応答を返す
+                    // Record を書き切った時点で、その Record に含まれる書き込みと
+                    // DATAGRAM へ応答を返す
                     if self.written >= self.output.len() {
                         self.process_write_events();
+                        self.process_datagram_events();
                     }
                 }
                 Wake::Write(Err(_)) => {
@@ -782,11 +913,29 @@ impl Driver {
                     self.pending_stop_sending
                         .push_back(StopSendingObserved { id, error_code });
                 }
+                DwnxEvent::Datagram { data } => {
+                    // DATAGRAM はフロー制御されないため、保持量に上限を設ける。
+                    // あふれた DATAGRAM は破棄し、個数をアプリケーションが
+                    // 観測できるように数えておく (draft-ietf-quic-qmux-02 Section 6、
+                    // RFC 9221 Section 5.3)。
+                    if self.datagram_tx.try_send(data).is_err() {
+                        self.datagram_drops = self.datagram_drops.saturating_add(1);
+                    }
+                }
                 DwnxEvent::ConnectionClosed => {
                     // 接続が閉じたかどうかは dwnx-rs の `is_closed()` が保持して
                     // いるため、ここでは何もしない。網羅性のために腕を残す。
                 }
             }
+        }
+    }
+
+    /// 破棄した DATAGRAM の累計個数をアプリケーションへ通知する
+    ///
+    /// 値が変わったときだけ watch で配る。
+    fn update_datagram_drops(&self) {
+        if *self.dropped_datagrams_tx.borrow() != self.datagram_drops {
+            let _ = self.dropped_datagrams_tx.send(self.datagram_drops);
         }
     }
 
@@ -926,6 +1075,32 @@ impl Driver {
         }
     }
 
+    /// DATAGRAM の送信結果をアプリケーションへ返す
+    ///
+    /// 書き出しを終えた Record に含まれる DATAGRAM だけを完了させる
+    /// ([`Self::process_write_events`] と同じ扱い)。dwnx は積んだ DATAGRAM の
+    /// 数だけ [`DwnxDatagramEvent`] を返すため、応答待ちのキューとは FIFO で
+    /// 対応する。
+    fn process_datagram_events(&mut self) {
+        while let Some(event) = self.connection.poll_datagram_event() {
+            let Some(ack) = self.pending_datagram_acks.pop_front() else {
+                // 応答待ちの無い結果は捨てる。ここには到達しない想定だが、
+                // 到達してもアプリケーションを待たせないようにする。
+                break;
+            };
+            match event {
+                DwnxDatagramEvent::Accepted => {
+                    let _ = ack.send(Ok(()));
+                }
+                DwnxDatagramEvent::Failed { error } => {
+                    // ピア非対応やサイズ超過はこの DATAGRAM だけの失敗であり、
+                    // 接続は閉じない (dwnx.h の dwnx_conn_writev_datagram を参照)
+                    let _ = ack.send(Err(Error::Dwnx(error)));
+                }
+            }
+        }
+    }
+
     /// 指定したストリームで最も古い応答を取り出す
     ///
     /// dwnx の送信待ちキューもこのキューも FIFO であるため、同じストリーム ID の
@@ -938,10 +1113,13 @@ impl Driver {
         self.pending_acks.remove(index)
     }
 
-    /// 応答を返していない書き込みをすべて失敗させる
+    /// 応答を返していない書き込みと DATAGRAM をすべて失敗させる
     fn fail_pending_acks(&mut self) {
         for pending in self.pending_acks.drain(..) {
             let _ = pending.ack.send(Err(Error::ConnectionClosed));
+        }
+        for ack in self.pending_datagram_acks.drain(..) {
+            let _ = ack.send(Err(Error::ConnectionClosed));
         }
     }
 
@@ -1004,6 +1182,14 @@ impl Driver {
             Command::StopSending { id, error_code } => {
                 let _ = self.connection.shutdown_read(id, error_code);
             }
+            Command::Datagram { data, ack } => {
+                // 接続が閉じている場合は送信されないため、ここで失敗を返す
+                if !self.connection.send_datagram(&data) {
+                    let _ = ack.send(Err(Error::ConnectionClosed));
+                    return;
+                }
+                self.pending_datagram_acks.push_back(ack);
+            }
             Command::PollReadable => {
                 // 受信側のチャネルに空きができたため、配送待ちを再開する
                 self.retry_stream_events();
@@ -1030,6 +1216,7 @@ impl Driver {
         self.pending_stop_sending.clear();
         self.pending_accept.clear();
         self.pending_commands.clear();
+        self.pending_datagram_acks.clear();
         self.output.clear();
     }
 }

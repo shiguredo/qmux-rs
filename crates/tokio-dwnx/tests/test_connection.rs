@@ -254,12 +254,21 @@ async fn close_truncates_long_reason() {
 
 #[tokio::test]
 async fn invalid_config_is_rejected() {
-    // dwnx の assert に掛かる設定は、接続を作る前にエラーになること
-    let cases: [(&str, TransportParameters); 3] = [
+    // dwnx が受け付けない設定は、接続を作る前にエラーになること
+    let cases: [(&str, TransportParameters); 4] = [
         (
             "max_record_size が既定値未満",
             TransportParameters {
                 max_record_size: 0,
+                ..test_config()
+            },
+        ),
+        (
+            "max_record_size が既定値超",
+            TransportParameters {
+                // dwnx はアプリケーションの指定を既定値へ強制するため、
+                // 既定値以外は設定の誤りとして拒否する
+                max_record_size: 65535,
                 ..test_config()
             },
         ),
@@ -935,4 +944,241 @@ async fn peer_close_shuts_down_write_side_before_driver_ends() {
         eof_elapsed < Duration::from_secs(1),
         "shutdown が linger ({SHUTDOWN_LINGER:?}) の期限を待たずに届くこと: EOF {eof_elapsed:?}"
     );
+}
+
+/// DATAGRAM を有効にしたテスト用の設定
+///
+/// `max_datagram_frame_size` は受信を受け付ける DATAGRAM フレームの最大サイズで
+/// あり、0 は DATAGRAM 拡張の非サポートを表す (RFC 9221 Section 3)。ローカルの
+/// Record 容量より大きい値にして、Record 容量の検査を検証できるようにする。
+fn datagram_config() -> TransportParameters {
+    TransportParameters {
+        max_datagram_frame_size: 65535,
+        ..test_config()
+    }
+}
+
+/// DATAGRAM を有効にした接続の組を作る
+fn connect_datagram() -> (Connection, Connection) {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::with_linger(Role::Client, client_io, datagram_config(), TEST_LINGER)
+        .expect("クライアントを作成できる");
+    let server = Connection::with_linger(Role::Server, server_io, datagram_config(), TEST_LINGER)
+        .expect("サーバーを作成できる");
+    (client, server)
+}
+
+#[tokio::test]
+async fn datagram_roundtrip() {
+    let (client, server) = connect_datagram();
+
+    // クライアントからサーバーへ DATAGRAM が届くこと
+    tokio::time::timeout(GUARD, client.send_datagram(b"hello datagram"))
+        .await
+        .expect("guard の時間内に送信が完了する")
+        .expect("DATAGRAM を送れる");
+    let received = tokio::time::timeout(GUARD, server.recv_datagram())
+        .await
+        .expect("guard の時間内に DATAGRAM が届く")
+        .expect("受信に失敗しない")
+        .expect("DATAGRAM が届く");
+    assert_eq!(
+        received, b"hello datagram",
+        "クライアントが送信した DATAGRAM がサーバーへ届くこと"
+    );
+
+    // サーバーからクライアントへも DATAGRAM が届くこと
+    tokio::time::timeout(GUARD, server.send_datagram(b"pong datagram"))
+        .await
+        .expect("guard の時間内に送信が完了する")
+        .expect("DATAGRAM を送れる");
+    let received = tokio::time::timeout(GUARD, client.recv_datagram())
+        .await
+        .expect("guard の時間内に DATAGRAM が届く")
+        .expect("受信に失敗しない")
+        .expect("DATAGRAM が届く");
+    assert_eq!(
+        received, b"pong datagram",
+        "サーバーが送信した DATAGRAM がクライアントへ届くこと"
+    );
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn multiple_datagrams_and_empty_datagram_are_received_in_order() {
+    // 空の DATAGRAM は 0 バイトの DATAGRAM フレームとして送れる
+    // (RFC 9221 Section 4)
+    let (client, server) = connect_datagram();
+
+    let payloads: [&[u8]; 3] = [b"first", b"", b"third"];
+    for payload in payloads {
+        tokio::time::timeout(GUARD, client.send_datagram(payload))
+            .await
+            .expect("guard の時間内に送信が完了する")
+            .expect("DATAGRAM を送れる");
+    }
+
+    // ドライバが受信イベントをチャネルへ移し終えるまで待つ。DATAGRAM は
+    // フロー制御されないため、受信側のドライバとアプリケーションの進み方は
+    // 非同期である。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 到着済みの DATAGRAM をまとめて取り出せること
+    let batch = tokio::time::timeout(GUARD, server.recv_datagrams())
+        .await
+        .expect("guard の時間内に DATAGRAM が届く")
+        .expect("受信に失敗しない")
+        .expect("DATAGRAM が届く");
+    assert_eq!(
+        batch,
+        payloads
+            .iter()
+            .map(|payload| payload.to_vec())
+            .collect::<Vec<_>>(),
+        "複数の DATAGRAM が積んだ順に届き、空の DATAGRAM も届くこと"
+    );
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn send_datagram_fails_when_peer_does_not_support_datagram() {
+    // ピアが DATAGRAM 拡張を広告していない場合はエラーになり、接続は閉じない
+    // (RFC 9221 Section 3)
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::with_linger(Role::Client, client_io, datagram_config(), TEST_LINGER)
+        .expect("クライアントを作成できる");
+    // サーバーは既定値 (max_datagram_frame_size = 0) のままにする
+    let server = Connection::with_linger(Role::Server, server_io, test_config(), TEST_LINGER)
+        .expect("サーバーを作成できる");
+
+    let result = tokio::time::timeout(GUARD, client.send_datagram(b"unsupported"))
+        .await
+        .expect("guard の時間内に応答が返る");
+    assert!(
+        matches!(&result, Err(tokio_dwnx::Error::Dwnx(_))),
+        "DATAGRAM 非対応のピアへの送信がエラーになること: {result:?}"
+    );
+    assert!(
+        !client.is_closed(),
+        "DATAGRAM 非対応は接続の終了ではないこと"
+    );
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn send_datagram_fails_when_datagram_is_too_large() {
+    // フレーム全体 (タイプと Length を含む) がピアの max_datagram_frame_size を
+    // 超える場合はエラーになり、接続は閉じない
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::with_linger(Role::Client, client_io, datagram_config(), TEST_LINGER)
+        .expect("クライアントを作成できる");
+    let server_config = TransportParameters {
+        max_datagram_frame_size: 100,
+        ..test_config()
+    };
+    let server = Connection::with_linger(Role::Server, server_io, server_config, TEST_LINGER)
+        .expect("サーバーを作成できる");
+
+    let payload = vec![0x5au8; 200];
+    let result = tokio::time::timeout(GUARD, client.send_datagram(&payload))
+        .await
+        .expect("guard の時間内に応答が返る");
+    assert!(
+        matches!(&result, Err(tokio_dwnx::Error::Dwnx(_))),
+        "ピアの上限を超える DATAGRAM の送信がエラーになること: {result:?}"
+    );
+    assert!(!client.is_closed(), "サイズ超過は接続の終了ではないこと");
+
+    // 上限内の DATAGRAM は引き続き送れること
+    tokio::time::timeout(GUARD, client.send_datagram(b"ok"))
+        .await
+        .expect("guard の時間内に送信が完了する")
+        .expect("上限内の DATAGRAM を送れる");
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn dropped_datagrams_are_counted() {
+    // 受信チャネルの容量を超える数の DATAGRAM を、アプリケーションが受信しない
+    // 間に送ると、あふれた分が破棄され、個数が観測できること
+    const TOTAL: usize = 100;
+    // ドライバの受信チャネルの容量 (DATAGRAM_CAPACITY) と同じ値
+    const CAPACITY: u64 = 64;
+
+    let (client, server) = connect_datagram();
+    for _ in 0..TOTAL {
+        tokio::time::timeout(GUARD, client.send_datagram(b"x"))
+            .await
+            .expect("guard の時間内に送信が完了する")
+            .expect("DATAGRAM を送れる");
+    }
+
+    // ドライバが受信イベントをチャネルへ移すまで待ち、破棄数を観測する。
+    // アプリケーションが受信しないため、チャネルに入るのは容量の 64 個だけで、
+    // 残りはすべて破棄される。
+    let expected = TOTAL as u64 - CAPACITY;
+    let mut dropped = 0;
+    for _ in 0..50 {
+        dropped = server.dropped_datagrams();
+        if dropped == expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        dropped, expected,
+        "受信しない間にあふれた DATAGRAM が破棄され、個数が観測できること"
+    );
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn send_datagram_fails_when_datagram_exceeds_record_capacity() {
+    // ピアが十分大きい max_datagram_frame_size (65535) を広告していても、
+    // ローカルの Record 容量 (DWNX_DEFAULT_MAX_RECORD_SIZE = 16382 バイト。
+    // フレームに使えるのは Record 長の 2 バイトを除いた 16380 バイト) を
+    // 超える DATAGRAM は送信できない。事前検査が無いと dwnx が NOBUF を
+    // 握りつぶし、send_datagram が永久に完了しない。
+    let (client, server) = connect_datagram();
+
+    let payload = vec![0x5au8; 16378];
+    let result = tokio::time::timeout(GUARD, client.send_datagram(&payload))
+        .await
+        .expect("guard の時間内に応答が返ること (永久に待たない)");
+    assert!(
+        matches!(&result, Err(tokio_dwnx::Error::Dwnx(_))),
+        "Record 容量を超える DATAGRAM の送信がエラーになること: {result:?}"
+    );
+    assert!(
+        !client.is_closed(),
+        "Record 容量超過は接続の終了ではないこと"
+    );
+
+    // 上限内の DATAGRAM は引き続き送れること
+    tokio::time::timeout(GUARD, client.send_datagram(b"fits"))
+        .await
+        .expect("guard の時間内に送信が完了する")
+        .expect("上限内の DATAGRAM を送れる");
+    let received = tokio::time::timeout(GUARD, server.recv_datagram())
+        .await
+        .expect("guard の時間内に DATAGRAM が届く")
+        .expect("受信に失敗しない")
+        .expect("DATAGRAM が届く");
+    assert_eq!(
+        received, b"fits",
+        "失敗の後でも上限内の DATAGRAM が届くこと"
+    );
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
 }
