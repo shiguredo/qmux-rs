@@ -48,6 +48,7 @@
 - `dwnx_datagram_larger_than_shiguredo_limit_is_reported_as_failure`
 - `dwnx_datagram_at_record_capacity_limit_is_transferred_to_shiguredo_server`
 - `dwnx_datagram_split_across_receives_is_reassembled_by_shiguredo_server`
+- `shiguredo_datagram_split_across_receives_is_reassembled_by_dwnx_server`
 - `shiguredo_stream_and_datagram_share_one_record_in_dwnx`
 - `dwnx_stream_and_datagram_share_one_record_in_shiguredo`
 
@@ -56,6 +57,7 @@
 TCP + TLS (rustls + aws-lc-sys) + ALPN で接続し、次を検証します。
 
 - ALPN がネゴシエートされること
+- ALPN が一致しない場合に TLS ハンドシェイクが失敗すること (no_application_protocol)
 - `tokio-qmux` クライアントから `tokio-dwnx` サーバーへ双方向ストリームでデータが届くこと
 - サーバーが返したエコーがクライアントに届くこと
 - `tokio-qmux` と `tokio-dwnx` の間で DATAGRAM が往復すること (空の DATAGRAM を含む)
@@ -86,10 +88,19 @@ ALPN を扱いません。QMux 上で動かすアプリケーションプロト�
     識別子を MUST とする (SVCB 互換のため) ため、この運用は同節から外れる。QMux 用の
     ALPN が定義された時点で見直す
   - 同一 ALPN の間は、QMux 非対応のサーバーに TCP で接続しても TLS は成功するため、
-    QMux のトランスポートパラメータ待ちにタイムアウトを設けて検知する。加えて、SVCB で
-    QUIC 用と QMux 用を区別できず、0-RTT のチケットも ALPN で分離されない
+    QMux のトランスポートパラメータ待ちを検知する必要がある。`shiguredo_qmux` と
+    `tokio-qmux` にはハンドシェイク専用のタイムアウトは無い。検知は利用者の責務であり、
+    `Config::max_idle_timeout` を設定するか、ALPN を検査して接続を中止する。加えて、
+    SVCB で QUIC 用と QMux 用を区別できず、0-RTT のチケットも ALPN で分離されない
 - 相互接続テスト: `hqx-01`
   - ストリームの echo のみを検証するため、dwnx の example と同じ識別子を使う
+
+QMux over TLS を使う実装は、アプリケーションプロトコルがネゴシエートされなかった場合に
+no_application_protocol アラートで TLS ハンドシェイクを中止しなければならない
+(draft-ietf-quic-qmux-02 Section 8.1)。サーバーだけでなくクライアントも中止する MUST を
+負う。rustls を使う場合、ハンドシェイク後に `alpn_protocol()` が `None` または期待値
+以外なら接続を中止する。`interop/tests/tokio_tls.rs` は ALPN 不一致でハンドシェイクが
+失敗する負の経路も検証する。
 
 ## 実行
 
@@ -127,6 +138,11 @@ cargo test -p interop --test tokio_tls
   `DWNX_ERR_INVALID_ARGUMENT` として通知し、接続は閉じない
   - dwnx 自身は Record に収まらない DATAGRAM フレームの `DWNX_ERR_NOBUF` を返さないため、
     dwnx-rs が送信前にフレーム長を検査している
+  - dwnx-rs の送信待ち DATAGRAM の上限超過と `close()` 後は、`send_datagram` が false を
+    返し `DatagramEvent` を通知しない。接続は閉じない
+- 上流 dwnx の DATAGRAM 受信サイズ検査は、RFC 9221 Section 3 が定めるフレーム全体の長さ
+  (タイプ + Length + ペイロード) ではなく、ペイロード長で比較している。境界値の
+  相互接続テストを追加する場合はこの差異に注意する (本リポジトリ側の欠陥ではない)
 
 ### `tokio-dwnx` 側
 
@@ -138,6 +154,9 @@ cargo test -p interop --test tokio_tls
   - 送信できる DATAGRAM は、ローカルの Record 容量 (16382 バイト) にフレーム全体が
     収まるものに限る。超える場合は `send_datagram` が `Error::Dwnx`
     (`DWNX_ERR_INVALID_ARGUMENT`) を返し、接続は閉じない
+  - 送信待ちの DATAGRAM には上限 (`dwnx_rs::MAX_PENDING_DATAGRAMS` 64 件、
+    `dwnx_rs::MAX_PENDING_DATAGRAM_BYTES` 512 KiB) がある。超過時と接続の閉鎖中は
+    `send_datagram` が `Error::DatagramQueueFull` を返し、接続は閉じない
 - `SendStream::write` は、渡したデータをドライバがすべて受け付け、下位トランスポートへ
   書き出し終えるまで待つ。フロー制御で保留された分も書き出してから戻る
 - 切断時は、自側の `close`、アイドルタイムアウト (draft-ietf-quic-qmux-02 Section 7.1)、
