@@ -143,9 +143,35 @@ fn bidirectional_stream_transfer() -> noprop::TestResult {
         // クライアントが双方向ストリームを開き、ランダムな分割で書き込む。
         // 残り全部を 1 回で書き込む経路と、複数回に分ける経路の両方を通す。
         // 書き込みのたびに転送するため、複数の Record にまたがる経路も通る。
+        // ピアが広告した上限とクレジットの照会 API がトランスポートパラメータと
+        // 一致する (RFC 9000 Section 18.2)
+        let peer = server.local_transport_parameters();
+        assert_eq!(
+            client.peer_max_streams_bidi(),
+            peer.initial_max_streams_bidi,
+            "ピアの双方向ストリーム上限を正しく照会できない"
+        );
+        assert_eq!(
+            client.peer_max_streams_uni(),
+            peer.initial_max_streams_uni,
+            "ピアの単方向ストリーム上限を正しく照会できない"
+        );
+        assert_eq!(
+            client.send_credit(),
+            peer.initial_max_data,
+            "接続レベルの送信クレジットを正しく照会できない"
+        );
+
         let id = client
             .open_bidi()
             .expect("ピアのトランスポートパラメータを受信済みなのでストリームを開ける");
+        assert_eq!(
+            client
+                .stream_send_credit(id)
+                .expect("送信側が未終端なので残量を取得できる"),
+            peer.initial_max_stream_data_bidi_remote,
+            "ストリーム単位の送信クレジットを正しく照会できない"
+        );
         let mut written = 0;
         let mut write_calls = 0;
         while written < payload.len() {

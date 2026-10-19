@@ -145,9 +145,23 @@ fn flow_control_preserves_stream_data() -> noprop::TestResult {
             // データを書き込み、送り終えたら FIN だけを送る。FIN は渡したデータを
             // すべて受け付けた場合にのみ送られるため、残りがあるうちは false を渡す。
             if offset < payload.len() {
+                // write が受け付ける量は、ストリーム単位と接続レベルのクレジットの
+                // 最小値を超えない (RFC 9000 Section 4.1)
+                let conn_credit = client.send_credit();
+                let stream_credit = client
+                    .stream_send_credit(id)
+                    .expect("送信側が未終端なので残量を取得できる");
                 let accepted = client
                     .write(id, &payload[offset..], false)
                     .expect("開いたばかりの双方向ストリームなので書き込める");
+                assert!(
+                    accepted as u64 <= conn_credit,
+                    "接続クレジットを超えて書き込みを受け付けた: accepted={accepted} credit={conn_credit}"
+                );
+                assert!(
+                    accepted as u64 <= stream_credit,
+                    "ストリームクレジットを超えて書き込みを受け付けた: accepted={accepted} credit={stream_credit}"
+                );
                 offset += accepted;
             } else {
                 client.write(id, &[], true).expect("FIN を送れる");

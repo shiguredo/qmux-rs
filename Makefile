@@ -1,4 +1,4 @@
-.PHONY: test interop-test pbt check clippy fmt fmt-fix fuzz-check fuzz-clippy fuzz-fmt fuzzing fuzzing-list clean
+.PHONY: test interop-test pbt check clippy fmt fmt-fix doc coverage fuzz-check fuzz-clippy fuzz-fmt fuzzing fuzzing-list clean
 
 # 全テストを実行する
 test:
@@ -12,7 +12,7 @@ interop-test:
 pbt:
 	cargo test -p pbt
 
-# Fuzzing を全ターゲットで 30 秒ずつ実行する
+# Fuzzing を全ターゲットで 30 秒ずつ実行する (nightly と cargo-fuzz が必要)
 fuzzing:
 	@for target in $$(cargo fuzz list); do \
 		echo "=== Fuzzing $$target ==="; \
@@ -39,12 +39,21 @@ fmt:
 fmt-fix:
 	cargo fmt --all
 
-# fuzz クレートの fmt 検査と check を実行する (CI の「Check fuzz crate」に対応)
+# CI の rustdoc 検査 (RUSTDOCFLAGS=-D warnings) を再現する
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --exclude dwnx-sys
+
+# カバレッジを計測する (cargo-llvm-cov と llvm-tools コンポーネントが必要)
+coverage:
+	cargo llvm-cov --workspace
+
+# fuzz クレートの fmt 検査、check、clippy を実行する (CI の「Check fuzz crate」に対応)
 fuzz-check:
 	cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 	cargo check --manifest-path fuzz/Cargo.toml
+	cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
-# fuzz クレートの clippy を実行する
+# fuzz クレートの clippy だけを実行する
 fuzz-clippy:
 	cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 

@@ -8,6 +8,7 @@
 use pbt::common::sample_bytes;
 use pbt::common::sample_nonempty_bytes;
 use pbt::common::test_runner;
+use shiguredo_qmux::codec::error::Error;
 use shiguredo_qmux::codec::varint;
 use shiguredo_qmux::record::DEFAULT_MAX_RECORD_SIZE;
 use shiguredo_qmux::record::RecordDecoder;
@@ -160,6 +161,13 @@ fn encode_error_condition() -> noprop::TestResult {
             );
         } else {
             err_seen.set(true);
+            // 送信側の誤りはピアへ通知するプロトコルエラーではなく、ローカルの
+            // エンコードエラー (InvalidData) として返さなければならない。
+            assert!(
+                matches!(result, Err(Error::InvalidData(_))),
+                "エンコードの失敗が InvalidData でない: payload_len={} max_record_size={max_record_size} {result:?}",
+                payload.len()
+            );
             assert!(
                 buf.is_empty(),
                 "エラー時にバッファへ書き込まれている: len={}",
@@ -197,8 +205,13 @@ fn encode_error_does_not_modify_buffer() -> noprop::TestResult {
 
         let mut buf = b"sentinel".to_vec();
         let before = buf.clone();
-        encode(&payload, max_record_size, &mut buf)
+        let error = encode(&payload, max_record_size, &mut buf)
             .expect_err("空ペイロードか max_record_size 超過なのでエラーになる");
+        assert!(
+            matches!(error, Error::InvalidData(_)),
+            "エンコードの失敗が InvalidData でない: payload_len={} max_record_size={max_record_size} {error:?}",
+            payload.len()
+        );
         assert_eq!(
             buf, before,
             "エラー時にバッファの内容が変化している: payload_len={} max_record_size={max_record_size}",

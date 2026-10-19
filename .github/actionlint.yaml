@@ -1,0 +1,9 @@
+# actionlint に認識させるラベル。
+# 組み込みのラベル (self-hosted, Linux, X64, macOS, ARM64 など) は宣言不要である。
+# ubuntu-26.04 / ubuntu-26.04-arm は GitHub ホステッドの runner だが、
+# actionlint 1.7.12 の組み込みリストに無い (Ubuntu 26.04 は 2026-09 に GA)。
+# リストへ入るまではここで宣言する。キー名は actionlint の設定のまま。
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

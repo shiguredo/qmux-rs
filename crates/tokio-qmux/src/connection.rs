@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
+use shiguredo_qmux::codec::error::{Error as QmuxError, TransportErrorCode};
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::Timestamp;
 use shiguredo_qmux::config::Config;
@@ -87,6 +88,33 @@ impl Command {
     }
 }
 
+/// ストリーム数の上限に達しているため、ピアの MAX_STREAMS を待って保留している
+/// open 要求
+///
+/// 上限に達した open は一時的な失敗であり、ピアが MAX_STREAMS で上限を増やせば
+/// 成功する。アプリケーションに一時エラーを返して再試行を強いるのではなく、
+/// ドライバが要求を保持し、`Event::StreamsAvailable` の処理時に再試行する。
+#[derive(Debug)]
+enum PendingOpen {
+    /// 双方向ストリームの open 要求
+    Bidirectional(oneshot::Sender<Result<(SendStream, RecvStream)>>),
+    /// 単方向ストリームの open 要求
+    Unidirectional(oneshot::Sender<Result<SendStream>>),
+}
+
+impl PendingOpen {
+    /// 呼び出し側が結果を待つのをやめたかどうか
+    ///
+    /// やめた要求を再試行すると、誰も使わないストリームを開いてクレジットを
+    /// 消費してしまうため、再試行の前に確認する。
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Bidirectional(reply) => reply.is_closed(),
+            Self::Unidirectional(reply) => reply.is_closed(),
+        }
+    }
+}
+
 /// コマンド送信チャネルの容量
 const COMMAND_CAPACITY: usize = 64;
 /// 接続を閉じる要求チャネルの容量
@@ -107,7 +135,7 @@ const STOP_SENDING_CAPACITY: usize = 16;
 const STREAM_EVENT_CAPACITY: usize = 16;
 /// 下位トランスポートから一度に読み取るバイト数の上限
 const READ_BUFFER_SIZE: usize = 64 * 1024;
-/// 自側の close の後でピアの shutdown を待つ上限の既定値 (3 秒)
+/// 自側の close とアイドルタイムアウトの後でピアの shutdown を待つ上限の既定値 (3 秒)
 ///
 /// ピアが送信側を shutdown しない限りドライバが終了しない状態を避けるため、待ち時間
 /// には必ず上限を設ける。QUIC version 1 の closing 状態が PTO の 3 倍を目安に終了する
@@ -165,8 +193,20 @@ impl Connection {
     /// 下位トランスポート上に QMux 接続を確立する
     ///
     /// `io` は接続済みの双方向バイトストリーム (TCP、TLS over TCP、UNIX ソケット、
-    /// テスト用の duplex など) を渡す。TLS と ALPN のネゴシエーションは呼び出し側の
-    /// 責務である。tokio ランタイムのコンテキストで呼び出すこと。
+    /// テスト用の duplex など) を渡す。tokio ランタイムのコンテキストで呼び出すこと。
+    ///
+    /// # TLS を使う場合の ALPN
+    ///
+    /// QMux over TLS では、アプリケーションは ALPN でアプリケーションプロトコルを
+    /// 合意しなければならない (draft-ietf-quic-qmux-02 Section 8.1 の MUST)。
+    /// TLS のハンドシェイク後に `alpn_protocol()` を確認し、`None` または期待値以外
+    /// であればハンドシェイクを中止すること。未ネゴシエートのまま接続すると、
+    /// QMux 非対応のピアと接続してトランスポートパラメータを待ち続けることになる。
+    ///
+    /// QMux 用の ALPN 識別子は、同じアプリケーションプロトコルを QUIC 上で使う場合の
+    /// 識別子と異なるものにしなければならない (同じ MUST の後段。SVCB との互換性と
+    /// 0-RTT チケットの分離のため)。ALPN の交渉と検査は下位トランスポートの責務で
+    /// あり、本クレートは TLS を所有しないため検査しない。
     ///
     /// ピアの shutdown を待つ上限は [`DEFAULT_LINGER`] を使う。変更する場合は
     /// [`Self::with_linger`] を使う。
@@ -188,14 +228,15 @@ impl Connection {
     ///
     /// [`Self::close`] を呼んだ後、ドライバは CONNECTION_CLOSE を送って下位
     /// トランスポートの送信側を graceful に shutdown し、ピアが送信側を shutdown
-    /// するのを待つ (draft-ietf-quic-qmux-02 Section 7.2)。`linger` はこの待ち時間の
-    /// 上限で、`close` を要求した時点から数える。
+    /// するのを待つ (draft-ietf-quic-qmux-02 Section 7.2)。アイドルタイムアウト
+    /// (Section 7.1) で終了する場合も、送信側を shutdown した後で同じ待ち合わせを
+    /// 行う。`linger` はこの待ち時間の上限で、終了が確定した時点から数える。
     ///
     /// 上限を過ぎるとドライバは下位トランスポートを閉じて終了し、[`Self::closed`] は
-    /// [`CloseReason::Local`] を返す。ピアが shutdown しない場合だけでなく、ピアが
-    /// 読み取りを止めて送信が詰まった場合にも、ドライバが残り続けないようにするためで
-    /// ある。`Duration::ZERO` を指定すると、送信側の shutdown を試みた後でピアの
-    /// shutdown を待たない。
+    /// [`CloseReason::Local`] または [`CloseReason::IdleTimeout`] を返す。ピアが
+    /// shutdown しない場合だけでなく、ピアが読み取りを止めて送信が詰まった場合にも、
+    /// ドライバが残り続けないようにするためである。`Duration::ZERO` を指定すると、
+    /// 送信側の shutdown を試みた後でピアの shutdown を待たない。
     ///
     /// # エラー
     ///
@@ -239,6 +280,7 @@ impl Connection {
             pending_writes: BTreeMap::new(),
             pending_readable: BTreeSet::new(),
             pending_commands: VecDeque::new(),
+            pending_opens: VecDeque::new(),
             pending_stop_sending: VecDeque::new(),
             pending_ping_acks: VecDeque::new(),
             pending_stream_events: VecDeque::new(),
@@ -250,11 +292,11 @@ impl Connection {
             linger,
             linger_started: None,
             write_shutdown: false,
-            linger_expired: false,
             read_scratch: vec![0u8; READ_BUFFER_SIZE],
             started: Instant::now(),
             close_reason: None,
             transport_ended: false,
+            read_closed: false,
         };
         tokio::spawn(driver.run());
 
@@ -273,6 +315,18 @@ impl Connection {
     }
 
     /// 双方向ストリームを開く
+    ///
+    /// ピアが広告した同時ストリーム数の上限に達している場合、このメソッドは一時
+    /// エラーを返さず、ピアが MAX_STREAMS で上限を増やすまで待つ。上限の増加は
+    /// ドライバが観測して future を解決する。接続が閉じた場合は
+    /// [`Error::ConnectionClosed`] を返す。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe ではない。待っている間に future を破棄しても、
+    /// ドライバがすでに open コマンドを処理していればストリームは開かれ、ハンドルは
+    /// 失われる (ストリームのクレジットを消費する)。ドライバがまだ処理していない
+    /// 場合、取り消された要求としてストリームを開かない。
     pub async fn open_bidirectional(&self) -> Result<(SendStream, RecvStream)> {
         let (reply, receive) = oneshot::channel();
         self.commands
@@ -283,6 +337,15 @@ impl Connection {
     }
 
     /// 単方向ストリームを開く
+    ///
+    /// ピアが広告した同時ストリーム数の上限に達している場合、このメソッドは一時
+    /// エラーを返さず、ピアが MAX_STREAMS で上限を増やすまで待つ
+    /// ([`Self::open_bidirectional`] と同じ)。接続が閉じた場合は
+    /// [`Error::ConnectionClosed`] を返す。
+    ///
+    /// # Cancel safety
+    ///
+    /// [`Self::open_bidirectional`] と同じく cancel safe ではない。
     pub async fn open_unidirectional(&self) -> Result<SendStream> {
         let (reply, receive) = oneshot::channel();
         self.commands
@@ -474,10 +537,28 @@ impl Connection {
     /// [`DEFAULT_LINGER`]、[`Self::with_linger`] では指定した値である。上限を過ぎると
     /// ドライバは下位トランスポートを閉じて終了し、[`Self::closed`] が
     /// [`CloseReason::Local`] を返す。
-    pub fn close(&self, error_code: u64, reason: &str) {
+    ///
+    /// このメソッドは要求を送るだけで、終了を待たない。終了状態は [`Self::closed`]
+    /// で確認する。すでに別の理由で閉じている場合 (ピアの切断を先に観測した場合など)
+    /// は、その理由が優先される。close 要求の送信に失敗した場合 (すでに未処理の
+    /// close 要求がある、またはドライバが終了している) も、接続は閉じる方向に
+    /// あるためエラーにしない。
+    ///
+    /// # エラー
+    ///
+    /// `error_code` はアプリケーションエラーコードで、可変長整数の最大値 (2^62-1)
+    /// 以下でなければならない (RFC 9000 Section 19.19)。超える値を渡した場合は
+    /// [`Error::Qmux`] を返し、要求は送らない。
+    pub fn close(&self, error_code: u64, reason: &str) -> Result<()> {
+        if error_code > shiguredo_qmux::codec::varint::MAX_VALUE {
+            return Err(Error::Qmux(QmuxError::InvalidData(format!(
+                "application error code {error_code} exceeds the maximum variable-length integer"
+            ))));
+        }
         let _ = self
             .close_request
             .try_send((error_code, reason.to_string()));
+        Ok(())
     }
 
     /// 接続が閉じたかどうか
@@ -486,6 +567,20 @@ impl Connection {
     }
 
     /// 接続が閉じるまで待ち、理由を返す
+    ///
+    /// 返る理由は次のいずれかである。
+    ///
+    /// - 自側が [`Self::close`] で閉じた場合: [`CloseReason::Local`]
+    /// - ピアが CONNECTION_CLOSE を送った場合: [`CloseReason::Peer`] (Section 7.3)
+    /// - ピアが下位トランスポートの送信側を shutdown した場合:
+    ///   [`CloseReason::PeerShutdown`] (Section 7.3)
+    /// - アイドルタイムアウトが満了した場合: [`CloseReason::IdleTimeout`] (Section 7.1)
+    /// - 下位トランスポートが利用できなくなった場合:
+    ///   [`CloseReason::TransportClosed`] (Section 7.4)
+    ///
+    /// 複数の理由が競合した場合は、最初に確定した理由を返す。ドライバが理由を
+    /// 通知せずに終了した場合も [`CloseReason::TransportClosed`] を返す。下位
+    /// トランスポートの I/O エラーの詳細は保持しない。
     ///
     /// # Cancel safety
     ///
@@ -550,6 +645,10 @@ struct Driver<T> {
     pending_readable: BTreeSet<StreamId>,
     /// 接続の確立を待っているコマンド
     pending_commands: VecDeque<Command>,
+    /// ストリーム数の上限に達しているため保留している open 要求
+    ///
+    /// ピアの MAX_STREAMS を受信して上限が増えたら再試行する。
+    pending_opens: VecDeque<PendingOpen>,
     /// 接続単位の通知チャネルが埋まっているため保留している STOP_SENDING
     pending_stop_sending: VecDeque<StopSendingObserved>,
     /// QX_PING の応答チャネルが埋まっているため保留している応答
@@ -585,8 +684,6 @@ struct Driver<T> {
     linger_started: Option<Instant>,
     /// 下位トランスポートの送信側を shutdown 済みかどうか
     write_shutdown: bool,
-    /// linger の上限を過ぎたかどうか
-    linger_expired: bool,
     /// ストリーム読み取り用の作業バッファ
     read_scratch: Vec<u8>,
     /// ドライバ開始時刻
@@ -595,6 +692,11 @@ struct Driver<T> {
     close_reason: Option<CloseReason>,
     /// 下位トランスポートが閉じたかどうか
     transport_ended: bool,
+    /// 下位トランスポートの読み取り側が終端したかどうか
+    ///
+    /// EOF または読み取りエラーの後も読み取りを待つと、EOF が即座に返り続けて
+    /// ビジーループになるため、待たないようにする。
+    read_closed: bool,
 }
 
 /// select で待つイベント
@@ -636,14 +738,41 @@ where
             self.retry_stream_events();
             self.retry_stop_sending();
             self.retry_ping_acks();
-            if self.close_reason.is_none() {
+            if self.close_reason.is_some() {
+                // 接続が閉じたため、open などの完了を待っているアプリケーションへ
+                // 失敗を通知する。保留したままドライバが終了した場合も oneshot の
+                // 破棄で同じ ConnectionClosed になるが、linger の間は待たせない。
+                self.fail_pending_requests();
+            } else {
                 self.retry_readable();
                 self.retry_writes();
+                // ストリーム数の上限に達して保留している open を再試行する。
+                // ピアが MAX_STREAMS で上限を増やすと Event::StreamsAvailable が
+                // 届き、このループで再試行される。
+                self.retry_pending_opens();
             }
             // 接続が閉じた場合は、そこから送信側の shutdown と、ピアの shutdown を
             // 待つ上限を数える
             if self.close_reason.is_some() {
                 self.start_linger();
+            }
+            // 終了が確定した後は、まだ書き出していない Record を送らない。
+            // アイドルタイムアウトは QMux フレームを送らないことを求めており
+            // (Section 7.2)、ピアの送信側 shutdown の観測もフレームを送らない選択を
+            // 許している (Section 7.3)。written == 0 なら未送信の output を破棄して
+            // 送信側の shutdown へ進む。
+            //
+            // written > 0 の場合は Record の途中まで送っている。ここで破棄すると
+            // Record の境界が崩れ、ピアが不正な入力として扱う。仕様の「フレームを
+            // 送らない」を満たしつつ境界を守るには送信途中の Record を完遂する以外に
+            // 安全な選択肢がないため、残りを書き切ってから shutdown する。
+            if self.written == 0
+                && matches!(
+                    self.close_reason,
+                    Some(CloseReason::IdleTimeout | CloseReason::PeerShutdown)
+                )
+            {
+                self.output.clear();
             }
             // 送信する Record を用意する。書きかけの Record があるうちは次の
             // Record を取り出さない (Record を途中で切らないため)
@@ -680,22 +809,22 @@ where
                     self.transport_ended = true;
                 }
             }
-            // 終了判定。自側から閉じた場合は、送信側を shutdown した後でピアの
-            // shutdown を待つ (draft-ietf-quic-qmux-02 Section 7.2)。ピア起因の切断や
-            // アイドルタイムアウトでは、自側の shutdown が済み次第終了する
-            // (Section 7.1 / 7.3)。いずれの場合も linger の上限を過ぎたら終了する。
-            let should_break = self.linger_expired
-                || match &self.close_reason {
-                    Some(CloseReason::TransportClosed) => true,
-                    Some(CloseReason::Local { .. }) => {
-                        (self.write_shutdown && self.transport_ended)
-                            || self.linger_remaining().is_some_and(|r| r.is_zero())
-                    }
-                    Some(_) => {
-                        self.write_shutdown || self.linger_remaining().is_some_and(|r| r.is_zero())
-                    }
-                    None => false,
-                };
+            // 終了判定。自側の close とアイドルタイムアウトでは、送信側を shutdown
+            // した後でピアの shutdown を待つ (draft-ietf-quic-qmux-02 Section 7.2 の
+            // SHOULD)。ピア起因の切断では、自側の shutdown が済み次第終了する
+            // (Section 7.3)。いずれの場合も linger の上限を過ぎたら終了する。
+            let should_break = match &self.close_reason {
+                // 下位トランスポートの閉塞では即座に終了する (Section 7.4)
+                Some(CloseReason::TransportClosed) => true,
+                Some(CloseReason::Local { .. }) | Some(CloseReason::IdleTimeout) => {
+                    (self.write_shutdown && self.transport_ended)
+                        || self.linger_remaining().is_some_and(|r| r.is_zero())
+                }
+                Some(_) => {
+                    self.write_shutdown || self.linger_remaining().is_some_and(|r| r.is_zero())
+                }
+                None => false,
+            };
             if should_break {
                 break;
             }
@@ -708,10 +837,19 @@ where
                 let written = self.written;
                 let command_rx = &mut self.command_rx;
                 let close_request_rx = &mut self.close_request_rx;
+                let read_closed = self.read_closed;
                 // 偏りのある選択はしない。読み取りが連続する間もコマンド・close 要求・
                 // タイマーが飢餓にならないようにするためである。
                 tokio::select! {
-                    result = reader.read(read_buf.as_mut_slice()) => Wake::Read(result),
+                    result = async {
+                        // 読み取り側が終端した後は待たない。EOF が即座に返り続けて
+                        // ビジーループになるためである。
+                        if read_closed {
+                            core::future::pending().await
+                        } else {
+                            reader.read(read_buf.as_mut_slice()).await
+                        }
+                    } => Wake::Read(result),
                     result = async {
                         // 書き出す Record が無いときは永久に待つ。0 バイトの書き込みを
                         // 繰り返してビジーループにならないようにするためである。
@@ -728,9 +866,22 @@ where
             };
 
             match wake {
-                Wake::Read(Ok(0)) | Wake::Read(Err(_)) => {
-                    // 下位トランスポートが閉じた (Section 7.4)。I/O エラーの詳細は
-                    // 保持せず、切断理由は CloseReason::TransportClosed に丸める。
+                Wake::Read(Ok(0)) => {
+                    // ピアが下位トランスポートの送信側を shutdown した (Section 7.3)。
+                    // TCP の FIN や TLS の close_notify がこれにあたる。自側の送信側も
+                    // graceful に shutdown するため、接続を閉じてから上の shutdown
+                    // 処理へ進む。読み取りエラー (Section 7.4) とは区別する。
+                    self.read_closed = true;
+                    self.connection.peer_shutdown();
+                    self.transport_ended = true;
+                    self.process_events();
+                    self.update_datagram_drops();
+                    self.retry_stop_sending();
+                }
+                Wake::Read(Err(_)) => {
+                    // 下位トランスポートが利用できなくなった (Section 7.4)。I/O エラーの
+                    // 詳細は保持せず、切断理由は CloseReason::TransportClosed に丸める。
+                    self.read_closed = true;
                     self.connection.transport_closed();
                     self.transport_ended = true;
                 }
@@ -761,7 +912,10 @@ where
                     self.transport_ended = true;
                 }
                 Wake::Close(Some((error_code, reason))) => {
-                    self.connection.close(error_code, &reason);
+                    // Sans I/O 側は可変長整数の範囲を超えるアプリケーションエラー
+                    // コードを受け付けない。その場合も接続は閉じないため、要求は
+                    // 無視される (呼び出し側は範囲内のコードで再度 close できる)。
+                    let _ = self.connection.close(error_code, &reason);
                 }
                 Wake::Close(None) => {
                     // Connection がドロップされた (close 要求チャネルの送信側が消えた)
@@ -784,7 +938,10 @@ where
 
     /// 次のタイマーまでのスリープ時間を返す
     ///
-    /// アイドルタイムアウトと linger の上限のうち、早い方までの時間を返す。
+    /// Sans I/O 側の `Connection::next_timeout` と linger の残り時間のうち、早い方
+    /// までの時間を返す。`next_timeout` は接続が閉じている間、アイドルタイムアウトが
+    /// 無効な場合、まだ Record を送受信していない場合に `None` を返す。どちらの
+    /// 期限も無い場合は `None` を返し、呼び出し側はタイマーなしで待つ。
     fn next_sleep_duration(&self) -> Option<Duration> {
         let idle = self.connection.next_timeout().map(|deadline| {
             let now = self.now().as_micros();
@@ -863,8 +1020,13 @@ where
                 Event::StreamReadable { id } => {
                     self.pending_readable.insert(id);
                 }
-                Event::StreamWritable { .. } | Event::StreamsAvailable { .. } => {
-                    // 次のループで保留中の書き込みを再試行する
+                Event::StreamWritable { .. } => {
+                    // 保留中の書き込みはループ先頭の retry_writes が毎回再試行する
+                }
+                Event::StreamsAvailable { .. } => {
+                    // 上限が増えたため、ループ先頭の retry_pending_opens が保留中の
+                    // open を再試行する。方向を問わず両方を試し、上限に達して
+                    // いない方向の要求はその場で成功する。
                 }
                 Event::StreamReset { id, error_code } => {
                     // リセットは失ってはならない制御信号である。チャネルが満杯の
@@ -1100,6 +1262,88 @@ where
         }
     }
 
+    /// ストリーム数の上限に達して保留している open を再試行する
+    ///
+    /// ピアが MAX_STREAMS で上限を増やすと `Event::StreamsAvailable` が届くため、
+    /// ループ先頭でこのメソッドを呼び、成功した要求の future を解決する。上限に
+    /// 達したままの要求は保留キューへ戻す。呼び出し側が待つのをやめた要求は、
+    /// ストリームを開かずに破棄する。
+    fn retry_pending_opens(&mut self) {
+        // 1 回の試行で開けるのは高々 1 本ずつであり、成功しても他の要求の上限が
+        // 増えることはないため、現在の件数だけ試せば足りる
+        let count = self.pending_opens.len();
+        for _ in 0..count {
+            let Some(pending) = self.pending_opens.pop_front() else {
+                break;
+            };
+            if pending.is_cancelled() {
+                continue;
+            }
+            match pending {
+                PendingOpen::Bidirectional(reply) => match self.connection.open_bidi() {
+                    Ok(id) => {
+                        let send = self.register_send(id);
+                        let recv = self.register_recv(id);
+                        let _ = reply.send(Ok((send, recv)));
+                    }
+                    Err(error) if is_stream_limit_error(&error) => {
+                        self.pending_opens
+                            .push_back(PendingOpen::Bidirectional(reply));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(Error::Qmux(error)));
+                    }
+                },
+                PendingOpen::Unidirectional(reply) => match self.connection.open_uni() {
+                    Ok(id) => {
+                        let send = self.register_send(id);
+                        let _ = reply.send(Ok(send));
+                    }
+                    Err(error) if is_stream_limit_error(&error) => {
+                        self.pending_opens
+                            .push_back(PendingOpen::Unidirectional(reply));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(Error::Qmux(error)));
+                    }
+                },
+            }
+        }
+    }
+
+    /// 接続の閉鎖が確定した時点で、完了を待っている要求を失敗させる
+    ///
+    /// ストリーム数の上限待ちで保留している open と、接続の確立待ちで保留している
+    /// コマンドが対象である。いずれも接続が閉じた後は成功し得ないため、待っている
+    /// アプリケーションへ [`Error::ConnectionClosed`] を返す。
+    fn fail_pending_requests(&mut self) {
+        while let Some(pending) = self.pending_opens.pop_front() {
+            match pending {
+                PendingOpen::Bidirectional(reply) => {
+                    let _ = reply.send(Err(Error::ConnectionClosed));
+                }
+                PendingOpen::Unidirectional(reply) => {
+                    let _ = reply.send(Err(Error::ConnectionClosed));
+                }
+            }
+        }
+        // 確立待ちのコマンドは open と DATAGRAM だけである (`requires_establishment`)
+        while let Some(command) = self.pending_commands.pop_front() {
+            match command {
+                Command::OpenBidirectional(reply) => {
+                    let _ = reply.send(Err(Error::ConnectionClosed));
+                }
+                Command::OpenUnidirectional(reply) => {
+                    let _ = reply.send(Err(Error::ConnectionClosed));
+                }
+                Command::Datagram { ack, .. } => {
+                    let _ = ack.send(Err(Error::ConnectionClosed));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 読み取り容量が空いたストリームからデータを読み取る
     fn retry_readable(&mut self) {
         let ids: Vec<StreamId> = self.pending_readable.iter().copied().collect();
@@ -1201,16 +1445,53 @@ where
     fn dispatch(&mut self, command: Command) {
         match command {
             Command::OpenBidirectional(reply) => {
-                let result = self.connection.open_bidi().map(|id| {
-                    let send = self.register_send(id);
-                    let recv = self.register_recv(id);
-                    (send, recv)
-                });
-                let _ = reply.send(result.map_err(Error::Qmux));
+                // 接続が閉じた後に届いた open は、ストリームを開かずに失敗させる
+                if self.close_reason.is_some() {
+                    let _ = reply.send(Err(Error::ConnectionClosed));
+                    return;
+                }
+                // 呼び出し側が待つのをやめた要求では、ストリームを開かない
+                if reply.is_closed() {
+                    return;
+                }
+                match self.connection.open_bidi() {
+                    Ok(id) => {
+                        let send = self.register_send(id);
+                        let recv = self.register_recv(id);
+                        let _ = reply.send(Ok((send, recv)));
+                    }
+                    // ストリーム数の上限はピアの MAX_STREAMS で増えるため、一時的な
+                    // 失敗として保留し、Event::StreamsAvailable で再試行する
+                    Err(error) if is_stream_limit_error(&error) => {
+                        self.pending_opens
+                            .push_back(PendingOpen::Bidirectional(reply));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(Error::Qmux(error)));
+                    }
+                }
             }
             Command::OpenUnidirectional(reply) => {
-                let result = self.connection.open_uni().map(|id| self.register_send(id));
-                let _ = reply.send(result.map_err(Error::Qmux));
+                if self.close_reason.is_some() {
+                    let _ = reply.send(Err(Error::ConnectionClosed));
+                    return;
+                }
+                if reply.is_closed() {
+                    return;
+                }
+                match self.connection.open_uni() {
+                    Ok(id) => {
+                        let send = self.register_send(id);
+                        let _ = reply.send(Ok(send));
+                    }
+                    Err(error) if is_stream_limit_error(&error) => {
+                        self.pending_opens
+                            .push_back(PendingOpen::Unidirectional(reply));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(Error::Qmux(error)));
+                    }
+                }
             }
             Command::Write { id, data, fin, ack } => {
                 self.pending_writes
@@ -1274,12 +1555,25 @@ where
     /// `self` を消費するため、この関数を抜けると下位トランスポートも閉じられる。
     /// 保持しているチャネルは drop で閉じるため、ここで明示的に破棄しない。
     fn finish(mut self) {
+        // ループ内で失敗させているが、終了経路の取りこぼしを防ぐために再度実行する
+        self.fail_pending_requests();
         let reason = self
             .close_reason
             .take()
             .unwrap_or(CloseReason::TransportClosed);
         let _ = self.closed_tx.send(Some(reason));
     }
+}
+
+/// ピアのストリーム数上限に達したことによるエラーかどうか
+///
+/// このエラーだけが、ピアから MAX_STREAMS を受信して上限が増えることで解消し得る
+/// 一時的な失敗である。open 要求をドライバ内に保留するかどうかの判定に使う。
+fn is_stream_limit_error(error: &QmuxError) -> bool {
+    matches!(
+        error,
+        QmuxError::Protocol { code, .. } if *code == TransportErrorCode::STREAM_LIMIT_ERROR
+    )
 }
 
 /// 指定した残り時間だけ待つ

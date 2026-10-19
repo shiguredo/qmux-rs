@@ -75,7 +75,15 @@ impl SendStream {
     /// 受け付け、保留分も送り終えるまで待つ。戻り値は受け付けたバイト数で、渡した
     /// データの長さと等しい。ピアが送信停止を要求している場合は
     /// [`Error::Stopped`] を返し、FIN 送信済みなどで送信側が終端している場合は
-    /// [`Error::StreamFinished`] を返す。
+    /// [`Error::StreamFinished`] を返す。接続が閉じた場合は
+    /// [`Error::ConnectionClosed`] を返す。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe ではない。内部ではドライバへ送信コマンドを
+    /// 送ってから完了を待つため、待っている間に future を破棄してもコマンドは
+    /// ドライバのキューに残り、データが送られる可能性がある。破棄した future を
+    /// 再試行すると、同じデータが重複して送られる。
     pub async fn write(&mut self, data: &[u8]) -> Result<usize> {
         self.check_stopped()?;
         if self.finished {
@@ -98,7 +106,15 @@ impl SendStream {
     /// ストリームの送信側を閉じる (FIN を送る)
     ///
     /// ピアがすでに送信停止を要求している場合は [`Error::Stopped`] を返す
-    /// ([`Self::write`] と同じ)。
+    /// ([`Self::write`] と同じ)。接続が閉じた場合は
+    /// [`Error::ConnectionClosed`] を返す。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe ではない。future を破棄しても FIN を送る
+    /// コマンドはドライバのキューに残り、FIN が送られる可能性がある。この場合
+    /// ハンドル側の「FIN 送信済み」の記録が失われるため、再度 [`Self::finish`] を
+    /// 呼ぶと終端済みの送信側への FIN 送出を試み、[`Error::Qmux`] になる。
     pub async fn finish(&mut self) -> Result<()> {
         self.check_stopped()?;
         if self.finished {
@@ -193,8 +209,12 @@ impl SendStream {
 /// ストリームの受信側
 ///
 /// このハンドルをドロップすると、ドライバはピアへ送信停止 (STOP_SENDING) を要求し、
-/// 以後そのストリームを読まない (RFC 9000 Section 3.5)。終端 (FIN または
-/// RESET_STREAM) を配送済みのストリームでは通知しない。
+/// 以後そのストリームを読まない (RFC 9000 Section 3.5)。ただし、次の場合は送信停止を
+/// 送らないことがある。
+///
+/// - 終端 (FIN または RESET_STREAM) を配送済みのストリームである
+/// - ドライバのコマンドチャネルが満杯である。この場合も、データの配送時に受信側の
+///   消失を検知した時点で同じ処理が行われる
 #[derive(Debug)]
 pub struct RecvStream {
     /// ストリーム ID
@@ -295,7 +315,8 @@ impl Drop for RecvStream {
     /// ピアが送り続けるデータを受け取らないため、ドライバは STOP_SENDING を送って
     /// ピアの送信側を終端させる (RFC 9000 Section 3.5)。ドライバのコマンドチャネルが
     /// 満杯の場合は通知を諦めるが、その場合もデータの配送時に受信側の消失を検知して
-    /// 同じ処理が行われる。
+    /// 同じ処理が行われる。終端を配送済みのストリームでは、ドライバ側の登録が外れて
+    /// いるため何も送らない。
     fn drop(&mut self) {
         let _ = self
             .commands

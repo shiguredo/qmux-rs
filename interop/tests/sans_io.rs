@@ -71,6 +71,9 @@ fn dwnx_config() -> TransportParameters {
 }
 
 /// 双方の送信 Record がなくなるまでバイト列を往復させる
+///
+/// 送信が止まらない不具合をアサーションの失敗ではなくテスト自体の失敗として
+/// 検出できるよう、上限の回数で収束しなかった場合は panic する。
 fn pump(sq: &mut SqConnection, dwnx: &mut DwnxConnection) {
     let now = Timestamp::from_micros(NOW_MICROS);
     for _ in 0..64 {
@@ -102,6 +105,7 @@ fn pump(sq: &mut SqConnection, dwnx: &mut DwnxConnection) {
             return;
         }
     }
+    panic!("双方の送信 Record が 64 回の往復で収束しなかった");
 }
 
 #[test]
@@ -938,6 +942,22 @@ fn shiguredo_stream_and_datagram_share_one_record_in_dwnx() {
         stream_data, b"stream in record",
         "同じ Record のストリームデータが届くこと"
     );
+    // 同じ Record ではストリームのフレームが先、DATAGRAM が後に並ぶ
+    let stream_position = events
+        .iter()
+        .position(|event| matches!(event, DwnxEvent::StreamData { .. }))
+        .expect("ストリームデータのイベントがある");
+    let datagram_position = events
+        .iter()
+        .position(|event| matches!(event, DwnxEvent::Datagram { .. }))
+        .expect("DATAGRAM のイベントがある");
+    assert!(
+        stream_position < datagram_position,
+        "同じ Record ではストリームデータが DATAGRAM より先に通知されること"
+    );
+
+    // DATAGRAM のイベントは取り出して比較する (取り出すと events から消えるため、
+    // 順序の確認より後に置く)
     assert_eq!(
         collect_dwnx_datagrams(&mut events),
         vec![b"datagram in record".to_vec()],
@@ -1049,6 +1069,47 @@ fn dwnx_datagram_split_across_receives_is_reassembled_by_shiguredo_server() {
         datagrams,
         vec![payload.to_vec()],
         "分割して渡された Record から DATAGRAM が組み立てられること"
+    );
+}
+
+#[test]
+fn shiguredo_datagram_split_across_receives_is_reassembled_by_dwnx_server() {
+    // shiguredo_qmux が書き出した Record を 1 バイトずつ dwnx へ渡しても、dwnx が
+    // DATAGRAM を部分配送し、dwnx-rs が 1 つのイベントに組み立てること。
+    let mut client =
+        SqConnection::new(Role::Client, sq_config()).expect("テスト用の接続を作成できる");
+    let mut server = DwnxConnection::server(&dwnx_config()).expect("dwnx サーバーを作れる");
+    pump(&mut client, &mut server);
+    while server.poll_event().is_some() {}
+
+    let payload = b"split into dwnx";
+    client.send_datagram(payload).expect("DATAGRAM を送れる");
+    let now = Timestamp::from_micros(NOW_MICROS);
+    let mut record = Vec::new();
+    assert!(
+        client.poll_transmit(&mut record, now).expect("送信できる"),
+        "DATAGRAM を含む Record が書き出されること"
+    );
+    assert!(
+        record.len() > 1,
+        "複数回に分けて渡せる大きさの Record であること"
+    );
+
+    // 1 バイトずつ渡す。dwnx の受信側で Record を跨いだ組み立てが行われる
+    for byte in &record {
+        server
+            .read(core::slice::from_ref(byte), NOW_MICROS)
+            .expect("1 バイトずつ読み取れる");
+    }
+
+    let mut events = Vec::new();
+    while let Some(event) = server.poll_event() {
+        events.push(event);
+    }
+    assert_eq!(
+        collect_dwnx_datagrams(&mut events),
+        vec![payload.to_vec()],
+        "分割して渡された Record から dwnx-rs が DATAGRAM を組み立てられること"
     );
 }
 

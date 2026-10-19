@@ -16,26 +16,51 @@ use crate::codec::varint::VarInt;
 use crate::record::DEFAULT_MAX_RECORD_SIZE;
 
 /// トランスポートパラメータ ID (RFC 9000 Section 18.2、RFC 9221 Section 3)
+///
+/// QMux で利用が許可されているのは [`param_id::MAX_IDLE_TIMEOUT`] から
+/// [`param_id::INITIAL_MAX_STREAMS_UNI`] までの 7 個だけで、それ以外の
+/// QUIC version 1 のパラメータは [`is_prohibited`] が `true` を返す (Section 5.1)。
 pub mod param_id {
+    /// クライアントの最初の Destination Connection ID (0x00、RFC 9000 Section 18.2)
     pub const ORIGINAL_DESTINATION_CONNECTION_ID: u64 = 0x00;
+    /// アイドルタイムアウト (ミリ秒、0x01、RFC 9000 Section 18.2)
     pub const MAX_IDLE_TIMEOUT: u64 = 0x01;
+    /// ステートレスリセット用のトークン (0x02、RFC 9000 Section 18.2)
     pub const STATELESS_RESET_TOKEN: u64 = 0x02;
+    /// エンドポイントが受信できる UDP ペイロードの最大サイズ (0x03、RFC 9000 Section 18.2)
     pub const MAX_UDP_PAYLOAD_SIZE: u64 = 0x03;
+    /// 接続レベルで受信できるデータ量の初期値 (0x04、RFC 9000 Section 18.2)
     pub const INITIAL_MAX_DATA: u64 = 0x04;
+    /// ローカル起動の双方向ストリームで受信できるデータ量の初期値 (0x05、RFC 9000 Section 18.2)
     pub const INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 0x05;
+    /// ピア起動の双方向ストリームで受信できるデータ量の初期値 (0x06、RFC 9000 Section 18.2)
     pub const INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
+    /// 単方向ストリームで受信できるデータ量の初期値 (0x07、RFC 9000 Section 18.2)
     pub const INITIAL_MAX_STREAM_DATA_UNI: u64 = 0x07;
+    /// ピアが起動できる双方向ストリーム数の初期値 (0x08、RFC 9000 Section 18.2)
     pub const INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
+    /// ピアが起動できる単方向ストリーム数の初期値 (0x09、RFC 9000 Section 18.2)
     pub const INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
+    /// ACK の遅延に適用する指数 (0x0a、RFC 9000 Section 18.2)
     pub const ACK_DELAY_EXPONENT: u64 = 0x0a;
+    /// ピアが ACK を遅延させてよい最大時間 (0x0b、RFC 9000 Section 18.2)
     pub const MAX_ACK_DELAY: u64 = 0x0b;
+    /// アクティブなコネクション移行を禁止する (0x0c、RFC 9000 Section 18.2)
     pub const DISABLE_ACTIVE_MIGRATION: u64 = 0x0c;
+    /// 優先アドレス (0x0d、RFC 9000 Section 18.2)
     pub const PREFERRED_ADDRESS: u64 = 0x0d;
+    /// アクティブなコネクション ID 数の上限 (0x0e、RFC 9000 Section 18.2)
     pub const ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
+    /// 最初の Source Connection ID (0x0f、RFC 9000 Section 18.2)
     pub const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
+    /// Retry 後の Source Connection ID (0x10、RFC 9000 Section 18.2)
     pub const RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
 
     // DATAGRAM 拡張 (RFC 9221 Section 3)
+    /// 受信を許可する DATAGRAM フレームの最大サイズ (0x20、RFC 9221 Section 3)
+    ///
+    /// 値はフレーム全体ではなく DATAGRAM のペイロードの最大長を表す。0 は
+    /// DATAGRAM 拡張を使わないことを意味する。
     pub const MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
 }
 

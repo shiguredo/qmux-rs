@@ -28,6 +28,16 @@ hooks = [
   { id = "tombi-format", exclude = { glob = "**/Cargo.lock" } },
 ]
 
+# markdownlint-cli2: Markdown のリンタ
+# 設定はリポジトリルートの .markdownlint.jsonc を読む
+# rev は prek auto-update で更新する
+[[repos]]
+repo = "https://github.com/DavidAnson/markdownlint-cli2"
+rev = "v0.23.3"
+hooks = [
+  { id = "markdownlint-cli2" },
+]
+
 [[repos]]
 repo = "local"
 hooks = [
@@ -57,6 +67,28 @@ hooks = [
     types = ["rust"],
     pass_filenames = false,
     priority = 10,
+  },
+  {
+    id = "cargo-clippy-fuzz",
+    name = "cargo clippy (fuzz)",
+    entry = "cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false,
+    priority = 10,
+  },
+  {
+    # actionlint はローカルに別途導入する (mise や Homebrew など)。
+    # actionlint 1.7.12 は ubuntu-26.04 系の runner ラベルを知らないため、
+    # ラベル未認識の警告だけを除外する
+    id = "actionlint",
+    name = "actionlint",
+    entry = "actionlint",
+    language = "system",
+    types = ["yaml"],
+    files = '^\.github/workflows/.*\.ya?ml$',
+    args = ["-ignore", 'label "ubuntu-26\.04(-arm)?" is unknown'],
+    priority = 5,
   },
   {
     id = "cargo-test",

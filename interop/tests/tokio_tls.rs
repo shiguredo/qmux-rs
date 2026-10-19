@@ -109,8 +109,11 @@ fn generate_certificates() -> TestCertificates {
     }
 }
 
-/// ALPN を設定したサーバー設定を作る
-fn server_config(certificates: &TestCertificates) -> Arc<rustls::ServerConfig> {
+/// ALPN を指定したサーバー設定を作る
+fn server_config_with_alpn(
+    certificates: &TestCertificates,
+    alpn: &[u8],
+) -> Arc<rustls::ServerConfig> {
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
@@ -118,8 +121,13 @@ fn server_config(certificates: &TestCertificates) -> Arc<rustls::ServerConfig> {
             rustls::pki_types::PrivateKeyDer::Pkcs8(certificates.key.clone_key()),
         )
         .expect("証明書を設定できる");
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.to_vec()];
     Arc::new(config)
+}
+
+/// ALPN を設定したサーバー設定を作る
+fn server_config(certificates: &TestCertificates) -> Arc<rustls::ServerConfig> {
+    server_config_with_alpn(certificates, ALPN)
 }
 
 /// CA を信頼するクライアント設定を作る
@@ -441,5 +449,56 @@ async fn dwnx_client_qmux_server_over_tls() {
 
     // tokio-dwnx の close (linger) でサーバーが接続の終了を観測すること
     connection.close(0, "done");
+    with_guard(server).await.expect("サーバータスクが終了する");
+}
+
+#[tokio::test]
+async fn alpn_mismatch_fails_tls_handshake() {
+    // draft-ietf-quic-qmux-02 Section 8.1: QMux over TLS では ALPN で
+    // アプリケーションプロトコルを合意する MUST があり、合意できない場合は
+    // no_application_protocol アラートでハンドシェイクを中止する。サーバーが
+    // クライアントの提示しない ALPN だけを広告した場合に、QMux の接続が
+    // 確立されないことを検証する。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let certificates = generate_certificates();
+    // サーバーはクライアントが提示しない ALPN だけを広告する
+    let tls_server_config = server_config_with_alpn(&certificates, b"hqx-02");
+    let tls_client_config = client_config(certificates.ca_cert.clone());
+
+    let listener = with_guard(TcpListener::bind("127.0.0.1:0"))
+        .await
+        .expect("listen できる");
+    let addr = listener.local_addr().expect("addr を取得できる");
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = with_guard(listener.accept()).await.expect("accept できる");
+        let acceptor = TlsAcceptor::from(tls_server_config);
+        // ALPN が一致しないため、サーバー側のハンドシェイクも完了しない
+        let error = with_guard(acceptor.accept(tcp))
+            .await
+            .expect_err("ALPN が一致しない場合はハンドシェイクに失敗する");
+        let text = format!("{error} / {error:?}");
+        assert!(
+            text.contains("NoApplicationProtocol") || text.contains("no_application_protocol"),
+            "no_application_protocol で失敗すること: {text}"
+        );
+    });
+
+    let tcp = with_guard(TcpStream::connect(addr))
+        .await
+        .expect("接続できる");
+    let connector = TlsConnector::from(tls_client_config);
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost").expect("名前を変換できる");
+    let error = with_guard(connector.connect(server_name, tcp))
+        .await
+        .expect_err("ALPN が一致しない場合はクライアントのハンドシェイクも失敗する");
+    let text = format!("{error} / {error:?}");
+    assert!(
+        text.contains("NoApplicationProtocol") || text.contains("no_application_protocol"),
+        "サーバーから no_application_protocol アラートが届くこと: {text}"
+    );
+
     with_guard(server).await.expect("サーバータスクが終了する");
 }

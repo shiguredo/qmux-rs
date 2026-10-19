@@ -117,7 +117,31 @@ pub fn is_allowed(frame_type: u64) -> bool {
 ///
 /// 成功時は (フレーム, 消費バイト数) を返す。QMux で禁止されたフレーム、QMux で
 /// 利用が許可されていないフレームタイプは `FRAME_ENCODING_ERROR` を返す
-/// (Section 4, RFC 9000 Section 12.4)。
+/// (Section 4, RFC 9000 Section 12.4)。フレームタイプは最短の可変長整数で
+/// エンコードされていなければならず、非最短形は `PROTOCOL_VIOLATION` を返す
+/// (RFC 9000 Section 12.4)。
+///
+/// # 途中データの扱い
+///
+/// 入力にフレームの全体が揃っていない場合は [`Error::Incomplete`] を返す。この関数は
+/// Record の境界を知らないため、フレームが途中で途切れているのか、単に続きの
+/// バイト列がまだ届いていないのかを区別できない。
+///
+/// Record の Frames フィールドをデコードする場合、Record の終端で
+/// [`Error::Incomplete`] が返ったらフレームが Record 境界で途切れていることを意味する。
+/// 呼び出し側はこれを `FRAME_ENCODING_ERROR` へ変換しなければならない
+/// (Section 3.2)。[`decode_record`] はこの変換を行う。ストリームの途中から届いた
+/// バイト列を逐次デコードする場合など、Record 境界以外で使う場合は、続きの
+/// バイト列を渡して再試行すればよい。
+///
+/// # フレーム分類の優先順位
+///
+/// 最初のフレームが禁止フレームまたは未知フレームの場合、Section 4 の
+/// 「禁止フレームと未知フレームは FRAME_ENCODING_ERROR」と Section 4.2 の
+/// 「最初のフレームは QX_TRANSPORT_PARAMETERS」(PROTOCOL_VIOLATION) の両方が
+/// 適用される。本実装はフレーム形式の判定を先に行うため、この場合は Section 4 の
+/// `FRAME_ENCODING_ERROR` を優先する。どちらの場合も接続は閉じるため、相互運用上の
+/// 影響はエラーコードの違いだけである。
 pub fn decode(buf: &[u8]) -> Result<(QmuxFrame, usize), Error> {
     // フレームタイプは最短の可変長整数でエンコードしなければならない。
     // RFC 9000 Section 12.4 が唯一の例外として Frame Type に最短形を要求し、

@@ -3,6 +3,10 @@
 //! 増分デコード、Size の上限、空の Record の拒否など、性質テストでは扱いにくい
 //! 境界値とエラー経路を検証する。正常系のラウンドトリップは PBT
 //! (`pbt/tests/prop_record.rs`) が担う。
+//!
+//! 同じ条件でも送信側と受信側でエラーの意味が異なることを検証する。Frames が空の
+//! Record は、送信側の [`encode`] ではローカルのエンコード誤り (`Error::InvalidData`)、
+//! 受信側の [`RecordDecoder::poll_record`] ではピアの違反 (`Error::Protocol`) になる。
 
 use shiguredo_qmux::codec::error::{Error, TransportErrorCode};
 use shiguredo_qmux::record::{DEFAULT_MAX_RECORD_SIZE, RecordDecoder, encode};
@@ -15,6 +19,16 @@ fn assert_protocol_error(error: Error, expected: TransportErrorCode) {
         }
         other => panic!("プロトコルエラーを期待したが {other:?} だった"),
     }
+}
+
+/// ローカルのエンコードエラーであることを確認する
+///
+/// 送信側のエラーはピアへ通知する必要がないため `InvalidData` で返す。
+fn assert_invalid_data(error: Error) {
+    assert!(
+        matches!(error, Error::InvalidData(_)),
+        "ローカルのエンコードエラーを期待したが {error:?} だった"
+    );
 }
 
 /// Frames フィールドの先頭に Size を付けた Record を組み立てる
@@ -51,6 +65,41 @@ fn encode_uses_two_byte_size_for_large_records() {
         "100 の 2 バイト表現が先頭に付くこと"
     );
     assert_eq!(&buf[2..], &frames, "Size の後ろが Frames であること");
+}
+
+#[test]
+fn encode_rejects_empty_frames_as_local_error() {
+    // Frames が空という送信側の誤りはローカルのエンコードエラー (InvalidData)。
+    // 受信側はピアの違反として PROTOCOL_VIOLATION を返す
+    // (decode_rejects_empty_record を参照)。
+    let mut buf = Vec::new();
+    let error =
+        encode(&[], DEFAULT_MAX_RECORD_SIZE, &mut buf).expect_err("空の Frames は拒否される");
+    assert_invalid_data(error);
+    assert!(buf.is_empty(), "エラー時にバッファへ書き込まないこと");
+}
+
+#[test]
+fn encode_rejects_frames_larger_than_peer_maximum_as_local_error() {
+    // ピアが広告した max_record_size の超過は、送信側の組み立ての誤りなので
+    // ローカルのエンコードエラー (InvalidData)。受信側は FRAME_ENCODING_ERROR
+    // (decode_rejects_record_larger_than_advertised_maximum を参照)。
+    let frames = [0x77; 100];
+    let mut buf = Vec::new();
+    let error = encode(&frames, 99, &mut buf).expect_err("上限を超える Frames は拒否される");
+    assert_invalid_data(error);
+    assert!(buf.is_empty(), "エラー時にバッファへ書き込まないこと");
+}
+
+#[test]
+fn encode_accepts_frames_at_peer_maximum() {
+    // 上限ちょうどは送信できる (Section 5.2 の MUST NOT は「超える」場合だけ)。
+    // 100 の Size は 2 バイトの可変長整数 (0x40 0x64) になる。
+    let frames = [0x55; 100];
+    let mut buf = Vec::new();
+    encode(&frames, 100, &mut buf).expect("上限ちょうどの Frames は送信できる");
+    assert_eq!(&buf[..2], &[0x40, 0x64], "Size が Frames の長さであること");
+    assert_eq!(&buf[2..], &frames, "Frames がそのまま続くこと");
 }
 
 #[test]

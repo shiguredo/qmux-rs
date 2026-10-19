@@ -5,7 +5,8 @@
 //! 使わないため、モックは不要である。
 
 use dwnx_rs::{
-    Connection, DatagramEvent, Event, MAX_CONFIG_STREAMS, TransportParameters, WriteEvent,
+    Connection, DatagramEvent, Event, MAX_CONFIG_STREAMS, MAX_PENDING_DATAGRAM_BYTES,
+    MAX_PENDING_DATAGRAMS, TransportParameters, WriteEvent,
 };
 use dwnx_sys as sys;
 
@@ -1084,5 +1085,247 @@ fn stream_data_and_datagram_share_one_record() {
         collect_datagrams(&events),
         vec![b"same record datagram".to_vec()],
         "同じ Record の DATAGRAM が届くこと"
+    );
+
+    // 同じ Record に載る場合の順序を確認する。dwnx-rs はストリームの送信を
+    // 先に試し、DWNX_ERR_WRITE_MORE を受けて同じ Record に DATAGRAM を続けて
+    // 書くため、受信側でもストリームデータの後に DATAGRAM が通知される。
+    let mut order = Vec::new();
+    for event in &events {
+        match event {
+            Event::StreamData { id: event_id, .. } if *event_id == id => order.push("stream"),
+            Event::Datagram { .. } => order.push("datagram"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        order,
+        ["stream", "datagram"],
+        "同じ Record ではストリームデータの後に DATAGRAM が並ぶこと"
+    );
+}
+
+#[test]
+fn datagrams_across_multiple_records_notify_each_completion() {
+    // 1 つの Record に収まらない大きさの DATAGRAM を複数積むと、Record を
+    // 跨いで送信される。積んだ数だけ完了が通知され、データも欠けないこと。
+    let mut client = Connection::client(&datagram_config(65535)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(65535)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    // 4000 バイトの DATAGRAM は 1 つの Record (16382 バイト) に 1 つしか
+    // 収まらないため、10 個を積むと 10 個の Record に分かれる
+    let payloads: Vec<Vec<u8>> = (0..10).map(|index| vec![index as u8; 4000]).collect();
+    for payload in &payloads {
+        assert!(
+            client.send_datagram(payload),
+            "DATAGRAM を送信待ちに積めること"
+        );
+    }
+
+    // Record を 1 つずつ書き出して受信側へ渡す。送信が止まらない場合に
+    // テストが終わらないよう上限を設ける
+    let mut records = 0;
+    loop {
+        let mut out = Vec::new();
+        if !client.poll_transmit(&mut out, NOW).expect("送信できる") {
+            break;
+        }
+        records += 1;
+        assert!(
+            records <= payloads.len() + 1,
+            "積んだ数に見合う回数で送信が終わること"
+        );
+        server.read(&out, NOW).expect("Record を読み取れる");
+    }
+    assert!(records > 1, "複数の Record に跨って送信されること");
+
+    // 積んだ数だけ Accepted が通知されること
+    let mut accepted = 0;
+    while let Some(event) = client.poll_datagram_event() {
+        match event {
+            DatagramEvent::Accepted => accepted += 1,
+            DatagramEvent::Failed { error } => panic!("DATAGRAM の送信に失敗した: {error}"),
+        }
+    }
+    assert_eq!(
+        accepted,
+        payloads.len(),
+        "複数の Record に跨っても積んだ数だけ完了が通知されること"
+    );
+
+    // 受信側でも欠けずに積んだ順で届くこと
+    let datagrams = collect_datagrams(&drain_events(&mut server));
+    assert_eq!(
+        datagrams, payloads,
+        "複数の Record に跨る DATAGRAM が積んだ順に届くこと"
+    );
+}
+
+#[test]
+fn send_datagram_after_close_is_rejected() {
+    // CONNECTION_CLOSE を生成した後は、DATAGRAM を積まずに false を返すこと。
+    // close 直後 (CONNECTION_CLOSE が未送信) と送信後の両方で確認する。
+    let mut client = Connection::client(&datagram_config(4096)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(4096)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    client.close(0, b"bye").expect("接続を閉じられる");
+    assert!(
+        !client.send_datagram(b"before close record"),
+        "close 直後の send_datagram が false を返すこと"
+    );
+
+    // CONNECTION_CLOSE を書き出して閉じた後も受け付けないこと
+    let mut record = Vec::new();
+    assert!(
+        client.poll_transmit(&mut record, NOW).expect("送信できる"),
+        "CONNECTION_CLOSE の Record が書き出されること"
+    );
+    assert!(client.is_closed(), "CONNECTION_CLOSE の送信で閉じること");
+    assert!(
+        !client.send_datagram(b"after close record"),
+        "close 後の send_datagram が false を返すこと"
+    );
+    assert!(
+        client.poll_datagram_event().is_none(),
+        "積んでいない DATAGRAM の失敗イベントは通知されないこと"
+    );
+
+    // ピアは CONNECTION_CLOSE を読めること
+    server
+        .read(&record, NOW)
+        .expect("CONNECTION_CLOSE を読み取れる");
+}
+
+#[test]
+fn pending_datagram_count_limit_rejects_new_submissions() {
+    // 送信待ちの DATAGRAM が件数の上限に達したら、それ以上は積まずに false を
+    // 返すこと。上限まで積んだ DATAGRAM は送信でき、空きができれば再び積めること。
+    let mut client = Connection::client(&datagram_config(65535)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(65535)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    let payloads: Vec<Vec<u8>> = (0..MAX_PENDING_DATAGRAMS)
+        .map(|index| vec![index as u8])
+        .collect();
+    for payload in &payloads {
+        assert!(
+            client.send_datagram(payload),
+            "上限までは DATAGRAM を積めること"
+        );
+    }
+    assert!(
+        !client.send_datagram(b"overflow"),
+        "件数の上限を超える DATAGRAM は積まずに false を返すこと"
+    );
+
+    // 上限まで積んだ DATAGRAM はすべて送信できること
+    pump(&mut client, &mut server, NOW);
+    let mut accepted = 0;
+    while let Some(event) = client.poll_datagram_event() {
+        match event {
+            DatagramEvent::Accepted => accepted += 1,
+            DatagramEvent::Failed { error } => panic!("DATAGRAM の送信に失敗した: {error}"),
+        }
+    }
+    assert_eq!(
+        accepted, MAX_PENDING_DATAGRAMS,
+        "上限まで積んだ DATAGRAM の完了がすべて通知されること"
+    );
+    assert_eq!(
+        collect_datagrams(&drain_events(&mut server)),
+        payloads,
+        "上限まで積んだ DATAGRAM が積んだ順に届くこと"
+    );
+
+    // 送信待ちが無くなれば再び積めること
+    assert!(
+        client.send_datagram(b"after drain"),
+        "送信待ちが空になったら再び積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+    assert_eq!(
+        collect_datagrams(&drain_events(&mut server)),
+        vec![b"after drain".to_vec()],
+        "上限の後でも DATAGRAM を送信できること"
+    );
+}
+
+#[test]
+fn pending_datagram_byte_limit_rejects_new_submissions() {
+    // 件数の上限に達する前に、ペイロードの合計バイト数の上限で積めなくなること。
+    // 1 つの Record に収まる最大の DATAGRAM (16377 バイト) を使い、件数では
+    // なくバイト数で上限に達する状況を作る。
+    let mut client = Connection::client(&datagram_config(65535)).expect("クライアントを作成できる");
+    let mut server = Connection::server(&datagram_config(65535)).expect("サーバーを作成できる");
+    pump(&mut client, &mut server, NOW);
+    drain_events(&mut client);
+    drain_events(&mut server);
+
+    let payload = vec![0x5au8; 16377];
+    // バイト数の上限だけを考慮したときに積める個数を求める
+    let mut expected = 0;
+    let mut bytes = 0;
+    while expected < MAX_PENDING_DATAGRAMS && bytes + payload.len() <= MAX_PENDING_DATAGRAM_BYTES {
+        bytes += payload.len();
+        expected += 1;
+    }
+    assert!(
+        expected < MAX_PENDING_DATAGRAMS,
+        "件数の上限より先にバイト数の上限へ達すること"
+    );
+
+    for _ in 0..expected {
+        assert!(
+            client.send_datagram(&payload),
+            "バイト数の上限までは DATAGRAM を積めること"
+        );
+    }
+    assert!(
+        !client.send_datagram(&payload),
+        "バイト数の上限を超える DATAGRAM は積まずに false を返すこと"
+    );
+
+    // 上限まで積んだ DATAGRAM はすべて送信できること
+    pump(&mut client, &mut server, NOW);
+    let mut accepted = 0;
+    while let Some(event) = client.poll_datagram_event() {
+        match event {
+            DatagramEvent::Accepted => accepted += 1,
+            DatagramEvent::Failed { error } => panic!("DATAGRAM の送信に失敗した: {error}"),
+        }
+    }
+    assert_eq!(
+        accepted, expected,
+        "バイト数の上限まで積んだ DATAGRAM の完了がすべて通知されること"
+    );
+    let datagrams = collect_datagrams(&drain_events(&mut server));
+    assert_eq!(
+        datagrams.len(),
+        expected,
+        "バイト数の上限まで積んだ DATAGRAM がすべて届くこと"
+    );
+    assert!(
+        datagrams.iter().all(|datagram| datagram == &payload),
+        "届いた DATAGRAM のデータが一致すること"
+    );
+
+    // 送信待ちが無くなれば再び積めること
+    assert!(
+        client.send_datagram(b"after drain"),
+        "送信待ちが空になったら再び積めること"
+    );
+    pump(&mut client, &mut server, NOW);
+    assert_eq!(
+        collect_datagrams(&drain_events(&mut server)),
+        vec![b"after drain".to_vec()],
+        "上限の後でも DATAGRAM を送信できること"
     );
 }

@@ -87,6 +87,26 @@ enum PendingDatagram {
 /// `dwnx_conn_write_vmsg`)、dwnx-rs 側で事前に検査する必要がある。
 const DWNX_QRE_RECORDLEN_SIZE: u64 = 2;
 
+/// 送信待ち DATAGRAM の件数上限
+///
+/// [`Connection::send_datagram`] は送信待ちの DATAGRAM がこの数に達していると、
+/// 新しい DATAGRAM を積まずに false を返す。DATAGRAM はフロー制御されないため
+/// (RFC 9221 Section 5.1)、アプリケーションが送信完了を待たずに積み続けると
+/// メモリを消費し続ける。件数の上限でそれを防ぐ。
+pub const MAX_PENDING_DATAGRAMS: usize = 64;
+
+/// 送信待ち DATAGRAM のペイロード合計バイト数の上限 (512 KiB)
+///
+/// 件数の上限だけでは、大きな DATAGRAM を積んだ場合にメモリ消費を抑えられない
+/// ため、バイト数にも上限を設ける。フレームの符号化に必要なタイプと Length は
+/// 含めず、アプリケーションが渡したペイロードの合計で数える。
+///
+/// 1 つの Record に収まる DATAGRAM のペイロードは最大 16377 バイトであり、
+/// 件数の上限 64 件では 64 × 16377 = 1048128 バイトになる。1 MiB
+/// (1048576 バイト) をバイト数の上限にすると、件数の上限に必ず先に達して
+/// バイト数の上限が実効を持たないため、それを下回る 512 KiB にしている。
+pub const MAX_PENDING_DATAGRAM_BYTES: usize = 512 * 1024;
+
 /// 送信待ちの書き込みの結果
 ///
 /// [`Connection::write`] で積んだ書き込みは [`Connection::poll_transmit`] の中で
@@ -164,6 +184,9 @@ pub struct Connection {
     /// 送信待ちの書き込みの結果
     write_events: VecDeque<WriteEvent>,
     /// 送信待ちの DATAGRAM
+    ///
+    /// 件数とペイロード合計バイト数には [`MAX_PENDING_DATAGRAMS`] と
+    /// [`MAX_PENDING_DATAGRAM_BYTES`] の上限がある。
     pending_datagrams: VecDeque<PendingDatagram>,
     /// 送信待ちの DATAGRAM の結果
     datagram_events: VecDeque<DatagramEvent>,
@@ -347,11 +370,32 @@ impl Connection {
     /// `DWNX_ERR_NOBUF` を握りつぶして何も返さないため、送信待ちに積まずに
     /// 失敗を確定させる。
     ///
-    /// 戻り値は送信待ちのキューに積んだかどうかである。接続が閉じている場合は
-    /// 送信されないため false を返す。[`Connection::close`] を呼んだ後に積んだ
-    /// DATAGRAM も、CONNECTION_CLOSE が優先されるため送信されない。
+    /// 戻り値は送信待ちのキューに積んだかどうかである。次の場合は積まずに false
+    /// を返す。いずれもキューに積んでいないため、[`DatagramEvent`] は通知しない。
+    ///
+    /// - 接続が閉じている場合。[`Connection::close`] を呼んだ後も含む
+    ///   (CONNECTION_CLOSE が優先されるため、積んだ DATAGRAM は送信されない)
+    /// - 送信待ちの DATAGRAM が [`MAX_PENDING_DATAGRAMS`] 件に達している場合
+    /// - 送信待ちの DATAGRAM のペイロード合計が [`MAX_PENDING_DATAGRAM_BYTES`]
+    ///   を超える場合
+    ///
+    /// 上限を超えた DATAGRAM の破棄はアプリケーションの判断に委ねる。戻り値が
+    /// false の場合は、送信待ちが減ってから積み直すこと。
     pub fn send_datagram(&mut self, data: &[u8]) -> bool {
-        if self.closed {
+        // close() は CONNECTION_CLOSE の Record を保持するだけで、送信するまで
+        // closed を立てない。close 後に積んだ DATAGRAM は送信されないため、
+        // close_record がある間も受け付けない。
+        if self.closed || self.close_record.is_some() {
+            return false;
+        }
+
+        // 送信待ちの件数とバイト数で上限を設ける。dwnx 側には送信待ちの上限が
+        // 無いため、アプリケーションが完了通知を待たずに積み続けるとメモリを
+        // 消費し続ける。上限に達したら積まずに false を返し、呼び出し側に
+        // バックプレッシャーを伝える。
+        if self.pending_datagrams.len() >= MAX_PENDING_DATAGRAMS
+            || self.pending_datagram_bytes().saturating_add(data.len()) > MAX_PENDING_DATAGRAM_BYTES
+        {
             return false;
         }
 
@@ -376,6 +420,23 @@ impl Connection {
         self.pending_datagrams
             .push_back(PendingDatagram::Data(data.to_vec()));
         true
+    }
+
+    /// 送信待ち DATAGRAM のペイロード合計バイト数を返す
+    ///
+    /// 送信できないことが確定している [`PendingDatagram::Rejected`] はデータを
+    /// 持たないため 0 バイトとして数える。件数は最大
+    /// [`MAX_PENDING_DATAGRAMS`] 件であるため、毎回数え直しても十分に安い。
+    fn pending_datagram_bytes(&self) -> usize {
+        self.pending_datagrams
+            .iter()
+            .fold(0usize, |total, pending| {
+                let len = match pending {
+                    PendingDatagram::Data(data) => data.len(),
+                    PendingDatagram::Rejected(_) => 0,
+                };
+                total.saturating_add(len)
+            })
     }
 
     /// 送信待ちの DATAGRAM の結果を 1 つ取り出す

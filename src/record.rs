@@ -4,6 +4,17 @@
 //! 構成される。Frames は QUIC version 1 のフレームを連結したバイト列で、Record の
 //! 境界は長さフィールドを省略したフレーム (LEN ビットなしの STREAM など) の終端にも
 //! なる。
+//!
+//! # エラーの方向
+//!
+//! 同じ「Frames が空」という条件でも、送信側と受信側でエラーの意味が異なる。
+//!
+//! - 送信側の [`encode`] はローカルのエンコード誤りなので [`Error::InvalidData`] を返す。
+//!   接続を閉じる必要はない。
+//! - 受信側の [`RecordDecoder::poll_record`] と [`crate::frame::decode_record`] は
+//!   ピアの違反なので [`Error::Protocol`] を返す。呼び出し側は `code` を持つ
+//!   CONNECTION_CLOSE を送る (空の Record は PROTOCOL_VIOLATION、`max_record_size`
+//!   超過は FRAME_ENCODING_ERROR)。
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -19,31 +30,43 @@ pub const DEFAULT_MAX_RECORD_SIZE: u64 = 16382;
 
 /// 1 つの QMux Record をエンコードしてバッファへ追加する
 ///
-/// `frames` には 1 つ以上のフレームを連結したバイト列を渡す。空の場合と、
-/// ピアが広告した `max_record_size` を超える場合はエラーを返す。エラー時は
-/// バッファの内容を変化させない。
+/// `frames` には 1 つ以上の完成したフレームを連結したバイト列を渡す。空の場合と、
+/// ピアが広告した `max_record_size` を超える場合は [`Error::InvalidData`] を返す。
+/// エラー時はバッファの内容を変化させない。
+///
+/// # 呼び出し側の責任
+///
+/// この関数は Frames フィールドのバイト列をそのまま Record 化するだけで、フレーム
+/// 列としての妥当性は検査しない。次の MUST を満たすのは呼び出し側の責任である。
+///
+/// - 禁止フレームを送らない (draft-ietf-quic-qmux-02 Section 4)
+/// - QX_TRANSPORT_PARAMETERS は最初のフレームとしてだけ送る (Section 4.2)
+/// - 各フレームを Record の境界で分断しない (Section 3.2)
+///
+/// [`crate::connection::Connection`] はこれらを満たしたフレーム列だけを渡す。
+/// 低レベル API を直接使う場合は、[`crate::frame::QmuxFrame::encode`] で完成した
+/// フレームを連結し、`max_record_size` に収まることを確認してから呼び出すこと。
 pub fn encode(frames: &[u8], max_record_size: u64, buf: &mut Vec<u8>) -> Result<(), Error> {
-    // Frames フィールドは 1 つ以上のフレームを含まなければならない (Section 3.2)
+    // Frames フィールドは 1 つ以上のフレームを含まなければならない (Section 3.2)。
+    // これはローカルのエンコード誤りであり、ピアへ通知するプロトコルエラーではない。
     if frames.is_empty() {
-        return Err(Error::Protocol {
-            code: TransportErrorCode::FRAME_ENCODING_ERROR,
-            reason: "QMux record must contain at least one frame".to_string(),
-        });
+        return Err(Error::InvalidData(
+            "QMux record must contain at least one frame".to_string(),
+        ));
     }
     let size = frames.len() as u64;
-    // ピアが広告した max_record_size を超える Record を送ってはならない (Section 5.2)
+    // ピアが広告した max_record_size を超える Record を送ってはならない (Section 5.2)。
+    // 送信側のローカルな設定・組み立ての誤りなので InvalidData とする。
     if size > max_record_size {
-        return Err(Error::Protocol {
-            code: TransportErrorCode::FRAME_ENCODING_ERROR,
-            reason: format!(
-                "QMux record size {size} exceeds peer max_record_size {max_record_size}"
-            ),
-        });
+        return Err(Error::InvalidData(format!(
+            "QMux record size {size} exceeds peer max_record_size {max_record_size}"
+        )));
     }
     // Size は Frames の長さで、Size フィールド自身は含まない (Section 3.2)
-    let size = VarInt::try_from(size).map_err(|_| Error::Protocol {
-        code: TransportErrorCode::FRAME_ENCODING_ERROR,
-        reason: format!("QMux record size {size} cannot be encoded as a variable-length integer"),
+    let size = VarInt::try_from(size).map_err(|_| {
+        Error::InvalidData(format!(
+            "QMux record size {size} cannot be encoded as a variable-length integer"
+        ))
     })?;
     size.encode_to_vec(buf);
     buf.extend_from_slice(frames);

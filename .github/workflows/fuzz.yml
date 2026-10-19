@@ -1,0 +1,64 @@
+name: Fuzz
+
+on:
+  # 毎日 03:00 JST (18:00 UTC) に実行する。cron は UTC で解釈される
+  schedule:
+    - cron: "0 18 * * *"
+  # 追加した検証を手動で実行して確認するために使う
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz
+    # cargo-fuzz は libFuzzer のビルドに C++ コンパイラが必要で、ubuntu-slim には
+    # 導入されていないため ubuntu-26.04 を使う
+    runs-on: ubuntu-26.04
+    # cargo-fuzz の導入と 5 ターゲットを各 60 秒実行することを含めた上限
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # cargo-fuzz は sanitizer を使うため nightly のツールチェーンが必要
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      # 実行環境の再現性のため cargo-fuzz のバージョンを固定する
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      # corpus は fuzz/.gitignore で追跡していないため、CI のキャッシュで共有する。
+      # キーに run_id を含めて毎回保存し、restore-keys で直近の corpus を引き継ぐ
+      - name: Restore corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      # 1 ターゲットがクラッシュしても残りのターゲットを実行し、最後にまとめて失敗させる。
+      # 入力 1 件あたりのタイムアウトも設定し、ハングをジョブのタイムアウトまで待たない
+      - name: Run fuzz targets
+        run: |
+          failed=0
+          for target in $(cargo +nightly fuzz list); do
+            echo "=== Fuzzing ${target} ==="
+            if ! cargo +nightly fuzz run "${target}" -- -max_total_time=60 -timeout=30; then
+              failed=1
+            fi
+          done
+          exit "${failed}"
+
+      # クラッシュを再現する入力 (fuzz/artifacts/<target>/crash-*) を保存する
+      - name: Upload artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

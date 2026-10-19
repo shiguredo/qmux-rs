@@ -84,31 +84,36 @@ use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::config::Config;
 use tokio_qmux::Connection;
 
-# async fn example() -> Result<(), tokio_qmux::Error> {
-// Config::default() はフロー制御のクレジットが 0 でデータを送れないため、明示的に設定する
-let config = Config {
-    initial_max_data: 64 * 1024,
-    initial_max_stream_data_bidi_local: 16 * 1024,
-    initial_max_stream_data_bidi_remote: 16 * 1024,
-    initial_max_stream_data_uni: 16 * 1024,
-    initial_max_streams_bidi: 8,
-    initial_max_streams_uni: 8,
-    ..Config::default()
-};
-let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-let client = Connection::new(Role::Client, client_io, config.clone())?;
-let server = Connection::new(Role::Server, server_io, config)?;
-# let _ = (client, server);
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> Result<(), tokio_qmux::Error> {
+    // Config::default() はフロー制御のクレジットが 0 でデータを送れないため、明示的に設定する
+    let config = Config {
+        initial_max_data: 64 * 1024,
+        initial_max_stream_data_bidi_local: 16 * 1024,
+        initial_max_stream_data_bidi_remote: 16 * 1024,
+        initial_max_stream_data_uni: 16 * 1024,
+        initial_max_streams_bidi: 8,
+        initial_max_streams_uni: 8,
+        ..Config::default()
+    };
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::new(Role::Client, client_io, config.clone())?;
+    let server = Connection::new(Role::Server, server_io, config)?;
+    // ここでは接続の作成だけを示す。実際の読み書きは examples/basic.rs を参照する
+    let _ = (client, server);
+    Ok(())
+}
 ```
+
+この例は tokio の `macros`、`rt-multi-thread`、`io-util` feature を有効にしている前提です。
 
 `Config::default()` はアイドルタイムアウト無効、フロー制御のクレジット 0、DATAGRAM 無効です。
 ストリームや DATAGRAM を使う場合は、上記のように必要な値を明示的に設定します。
 
 下位トランスポートには接続済みの双方向バイトストリームを渡します。TLS と ALPN の
 ネゴシエーションは呼び出し側の責務です。実行可能な最小例は
-`crates/tokio-qmux/examples/basic.rs` にあります。
+[crates/tokio-qmux/examples/basic.rs](https://github.com/shiguredo/qmux-rs/blob/develop/crates/tokio-qmux/examples/basic.rs)
+にあります。
 
 ## テスト
 
@@ -127,22 +132,59 @@ make fuzzing
 
 # Fuzzing ターゲット一覧
 make fuzzing-list
+
+# rustdoc の検査 (CI と同じ RUSTDOCFLAGS=-D warnings)
+make doc
+
+# カバレッジの計測
+make coverage
 ```
+
+`make fuzzing` は nightly ツールチェーンと cargo-fuzz を使います。初回は次のコマンドで
+導入してください。
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+`fuzz/corpus` と `fuzz/artifacts` はリポジトリに含めていません。GitHub Actions の Fuzz
+workflow は毎日実行され、corpus をキャッシュで引き継ぎ、失敗時は `fuzz/artifacts` を
+artifact として保存します。クラッシュを再現するときは、保存された入力を次のように
+渡します。
+
+```bash
+cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<input>
+```
+
+`make coverage` は cargo-llvm-cov を使います。cargo-llvm-cov は
+`cargo install cargo-llvm-cov` で導入してください。llvm-tools コンポーネントは
+rust-toolchain.toml で導入しています。
 
 `dwnx-sys` のビルドには git、C11 コンパイラ、libclang (bindgen 用) が必要です。
 macOS では `LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib` を設定します。
 
-詳細は [docs/QMUX.md](./docs/QMUX.md) と [docs/INTEROP.md](./docs/INTEROP.md) を
+詳細は [docs/QMUX.md](https://github.com/shiguredo/qmux-rs/blob/develop/docs/QMUX.md) と
+[docs/INTEROP.md](https://github.com/shiguredo/qmux-rs/blob/develop/docs/INTEROP.md) を
 参照してください。
 
-## 準拠仕様
+## 対応プラットフォーム
+
+Linux (x86_64 / aarch64) と macOS (aarch64) で CI を実行しています。Windows は未対応
+です。`crates/dwnx-sys/build.rs` には Windows 向けの分岐がありますが、CI ではビルドして
+おらず未検証です。
+
+## 参照仕様
+
+本クレートは [draft-ietf-quic-qmux-02](https://datatracker.ietf.org/doc/draft-ietf-quic-qmux/)
+に準拠しています。それ以外は参照している仕様です。
 
 | 仕様 | 内容 |
 | --- | --- |
 | [draft-ietf-quic-qmux-02](https://datatracker.ietf.org/doc/draft-ietf-quic-qmux/) | QMux |
 | [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) | QUIC version 1 |
 | [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221) | QUIC DATAGRAM 拡張 |
-| [RFC 7301](https://www.rfc-editor.org/rfc/rfc7301) | TLS ALPN |
+| [RFC 7301](https://www.rfc-editor.org/rfc/rfc7301) | TLS ALPN (ALPN は下位トランスポートの責務であり、本クレートは関与しない) |
 
 ## ライセンス
 

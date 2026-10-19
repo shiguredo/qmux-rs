@@ -13,7 +13,12 @@ pub struct ConnectionClose {
     pub application: bool,
     /// エラーコード
     pub error_code: u64,
-    /// トランスポートエラーの場合のみ: エラーを引き起こしたフレームタイプ
+    /// トランスポートエラー (0x1c) の場合のみ: エラーを引き起こしたフレームタイプ
+    ///
+    /// `None` は引き起こしたフレームタイプが不明であることを表す。0x1c では
+    /// フィールド自体が必須のため、[`ConnectionClose::encode`] は `None` を
+    /// 未知を表す 0 として出力する (RFC 9000 Section 19.19)。アプリケーション
+    /// エラー (0x1d) ではこのフィールドは使われず、値にかかわらず出力しない。
     pub frame_type: Option<u64>,
     /// 理由を示す UTF-8 文字列
     pub reason_phrase: Vec<u8>,
@@ -66,6 +71,11 @@ impl ConnectionClose {
     }
 
     /// フレームタイプを含めてバッファへエンコードする
+    ///
+    /// RFC 9000 Section 19.19: Frame Type フィールドは 0x1c (トランスポートエラー)
+    /// だけが持つ。0x1d (アプリケーションエラー) では出力しない。0x1c では
+    /// [`ConnectionClose::frame_type`] が `None` でも必ずフィールドを出力し、未知の
+    /// フレームタイプを表す 0 を書き込む (RFC 9000 Section 19.19)。
     pub fn encode(&self, buf: &mut Vec<u8>) {
         let ft = if self.application {
             super::frame_type::APPLICATION_CLOSE
@@ -82,10 +92,11 @@ impl ConnectionClose {
         // エラー) のみが持つ。0x1d (アプリケーションエラー) では送ってはならない。
         // フィールドの有無は self.application ではなくフレームタイプで決まるため、
         // frame_type が Some でも application が true のときは出力しない。
-        if !self.application
-            && let Some(frame_type) = self.frame_type
-        {
-            VarInt::try_from(frame_type)
+        // 逆に 0x1c では frame_type が None でもフィールド自体は必須であり、
+        // 未知のフレームタイプを表す 0 を出力する。省略するとデコード側が
+        // reason phrase の長さを Frame Type として読む不正フレームになる。
+        if !self.application {
+            VarInt::try_from(self.frame_type.unwrap_or(0))
                 .expect("value fits in a variable-length integer")
                 .encode_to_vec(buf);
         }

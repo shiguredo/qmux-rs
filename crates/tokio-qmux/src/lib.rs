@@ -14,7 +14,13 @@
 //! 腕に置いても安全な cancel safety を持つ。
 //!
 //! TLS と ALPN のネゴシエーションは呼び出し側の責務である。[`Connection::new`] には
-//! 接続済みの双方向バイトストリームを渡す。
+//! 接続済みの双方向バイトストリームを渡す。QMux over TLS では、アプリケーションは
+//! ALPN でアプリケーションプロトコルを合意しなければならず
+//! (draft-ietf-quic-qmux-02 Section 8.1 の MUST)、ハンドシェイク後に
+//! `alpn_protocol()` が `None` または期待値以外ならハンドシェイクを中止すること。
+//! QMux 用の ALPN 識別子は、同じアプリケーションプロトコルを QUIC 上で使う場合の
+//! 識別子と分離しなければならない (同じ MUST の後段)。本クレートは TLS を所有しない
+//! ため、この検査は行わない。
 //!
 //! # 送信の詰まり
 //!
@@ -27,16 +33,27 @@
 //!
 //! [`Connection::close`] を呼ぶと CONNECTION_CLOSE が送られ、ドライバは下位
 //! トランスポートの送信側を graceful に shutdown した後、ピアが送信側を shutdown
-//! するのを待つ (draft-ietf-quic-qmux-02 Section 7.2)。ピアが shutdown しない場合や、
-//! ピアが読み取りを止めて送信が詰まった場合にドライバが残り続けないよう、待ち時間には
-//! 上限を設ける。既定値は [`DEFAULT_LINGER`] (3 秒) で、[`Connection::with_linger`] で
-//! 変更できる。上限を過ぎるとドライバは下位トランスポートを閉じて終了し、
-//! [`Connection::closed`] が [`shiguredo_qmux::event::CloseReason::Local`] を返す。
+//! するのを待つ (draft-ietf-quic-qmux-02 Section 7.2 の SHOULD)。ピアが shutdown
+//! しない場合や、ピアが読み取りを止めて送信が詰まった場合にドライバが残り続けない
+//! よう、待ち時間には上限を設ける。既定値は [`DEFAULT_LINGER`] (3 秒) で、
+//! [`Connection::with_linger`] で変更できる。上限を過ぎるとドライバは下位
+//! トランスポートを閉じて終了し、[`Connection::closed`] が
+//! [`shiguredo_qmux::event::CloseReason::Local`] を返す。
 //!
-//! アイドルタイムアウト (Section 7.1) とピアが送ってきた CONNECTION_CLOSE
-//! (Section 7.3) でも、送信側を shutdown してから終了する。下位トランスポートの閉塞
-//! (Section 7.4) では即座に終了する。[`Connection`] をドロップした場合は linger を
-//! 待たずに下位トランスポートを閉じて終了する。
+//! アイドルタイムアウト (Section 7.1) でも、QMux フレームを新たに送らずに送信側を
+//! shutdown し、自側の close と同じくピアの shutdown を linger の上限まで待つ
+//! (Section 7.2)。終了が確定した時点でまだ書き出していない Record は破棄する。
+//! 書きかけの Record がある場合は、途中で破棄すると Record の境界が崩れるため、
+//! その Record だけは書き切ってから shutdown する。
+//!
+//! 下位トランスポートの読み取りで EOF (TCP の FIN、TLS の close_notify など) を
+//! 観測した場合は、ピアが送信側を shutdown したものとして扱い (Section 7.3)、
+//! 自側の送信側も shutdown してから終了する。このとき
+//! [`Connection::closed`] は [`shiguredo_qmux::event::CloseReason::PeerShutdown`] を
+//! 返す。読み取りエラー (TCP のリセット、TLS の fatal alert など) は下位
+//! トランスポートの閉塞 (Section 7.4) として即座に終了し、
+//! [`shiguredo_qmux::event::CloseReason::TransportClosed`] を返す。[`Connection`] を
+//! ドロップした場合は linger を待たずに下位トランスポートを閉じて終了する。
 //!
 //! # QUIC の上で動かす場合との違い
 //!

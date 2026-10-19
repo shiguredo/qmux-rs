@@ -14,10 +14,67 @@ use crate::codec::error::{Error, TransportErrorCode};
 use crate::codec::frame;
 use crate::codec::frame::Frame;
 use crate::codec::role::Role;
-use crate::codec::varint::VarInt;
+use crate::codec::varint::{MAX_VALUE, VarInt};
 
 use crate::event::Event;
 use crate::transport_params::{MAX_STREAMS_LIMIT, TransportParameters};
+
+/// 送信時に適用する上限の更新 (RFC 9000 Section 4.6)
+///
+/// RFC 9000 Section 4.6 は「ピアへ送信した上限」を基準に、それを超えるデータや
+/// ストリームをエラーにすることを MUST とする。広告フレームを送信待ちへ積んだ
+/// 時点で内部の上限を進めると、ピアがまだ受け取っていない上限まで受理してしまう。
+/// そのため上限の更新は、フレームが実際に Record へ書き出されるまで遅延させ、
+/// 送信時にこの効果で適用する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingEffect {
+    /// MAX_DATA を広告した (接続レベルの受信データ上限)
+    DataLimitAdvanced(u64),
+    /// MAX_STREAM_DATA を広告した (ストリーム単位の受信データ上限)
+    StreamWindowExtended {
+        /// 対象のストリーム
+        id: StreamId,
+        /// 広告したストリーム単位の受信上限
+        limit: u64,
+    },
+    /// MAX_STREAMS を広告した (同時に開けるストリーム数の上限)
+    StreamsGranted {
+        /// 双方向ストリームの上限かどうか (false は単方向)
+        bidirectional: bool,
+        /// 広告したストリーム数の上限
+        limit: u64,
+    },
+}
+
+/// 送信待ちのフレーム
+#[derive(Debug)]
+pub(crate) struct PendingFrame {
+    /// エンコード済みのフレーム
+    pub(crate) bytes: Vec<u8>,
+    /// Record へ書き出した時点で適用する効果
+    pub(crate) effect: Option<PendingEffect>,
+}
+
+impl PendingFrame {
+    /// 効果を持たないフレームを作る
+    ///
+    /// QX_PING や CONNECTION_CLOSE など、送信に伴う上限の更新を伴わないフレームに
+    /// 使う。
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            effect: None,
+        }
+    }
+
+    /// 送信時に適用する効果を持つフレームを作る
+    fn with_effect(bytes: Vec<u8>, effect: PendingEffect) -> Self {
+        Self {
+            bytes,
+            effect: Some(effect),
+        }
+    }
+}
 
 /// ストリームの種別 (RFC 9000 Section 2.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,10 +263,22 @@ struct Stream {
     last_stream_data_blocked: Option<u64>,
     /// 次に受信するバイトのオフセット
     recv_offset: u64,
-    /// アプリケーションが読み取ったバイト数の合計 (MAX_STREAM_DATA の前進基準)
+    /// アプリケーションが読み取ったバイト数の合計
     read_offset: u64,
+    /// アプリケーションが読み取ったか、STOP_SENDING 後に破棄したバイト数の合計
+    ///
+    /// MAX_STREAM_DATA の前進基準である。破棄したデータもクレジットを返すため、
+    /// 読み取り済みのバイト数とは別に数える。
+    consumed_offset: u64,
     /// 自エンドポイントが許可したストリーム単位の受信上限 (絶対オフセット)
+    ///
+    /// ピアへ実際に送信済みの値だけを反映する (RFC 9000 Section 4.6)。
     recv_max_data: u64,
+    /// 送信待ちの MAX_STREAM_DATA で広告する予定の受信上限
+    ///
+    /// フレームが Record へ書き出された時点で `recv_max_data` へ反映する。
+    /// 未送信の広告を重複して積まないための目印でもある。
+    pending_recv_max_data: Option<u64>,
     /// 受信ウィンドウの初期値 (クレジット更新の閾値)
     recv_window: u64,
     /// 受信したがアプリケーションがまだ読み取っていないデータ
@@ -224,6 +293,21 @@ struct Stream {
     stop_sending_notified: bool,
     /// 書き込み可能イベントを通知済みかどうか (同じクレジットでの重複通知の抑止)
     writable_notified: bool,
+    /// 接続レベルのクレジットが 0 のため書き込みが止まっているかどうか
+    ///
+    /// MAX_DATA を受信したときに、通知すべきストリームを絞り込むために使う
+    /// (1 バイトの増加で全ストリームへ通知する増幅を避ける)。
+    conn_blocked: bool,
+    /// ストリーム単位のクレジットが 0 のため書き込みが止まっているかどうか
+    ///
+    /// フロー制御でブロックしている間に DATA_BLOCKED / STREAM_DATA_BLOCKED を
+    /// 周期的に再送するかどうかの判定に使う (RFC 9000 Section 4.1)。
+    stream_blocked: bool,
+    /// アプリケーションが STOP_SENDING を送信済みかどうか
+    ///
+    /// 送信済みの場合、以後に到着する STREAM フレームのデータはバッファせず
+    /// 破棄し、フロー制御の会計だけを行う (RFC 9000 Section 3.5)。
+    local_stop_sending: bool,
 }
 
 impl Stream {
@@ -251,7 +335,13 @@ struct FlowControl {
     /// 送信したストリームデータの合計
     send_total: u64,
     /// 自エンドポイントが許可した受信上限 (絶対バイト数)
+    ///
+    /// ピアへ実際に送信済みの値だけを反映する (RFC 9000 Section 4.6)。
     recv_max_data: u64,
+    /// 送信待ちの MAX_DATA で広告する予定の受信上限
+    ///
+    /// フレームが Record へ書き出された時点で `recv_max_data` へ反映する。
+    pending_recv_max_data: Option<u64>,
     /// 受信したストリームデータの合計 (RESET_STREAM の最終サイズを含む)
     recv_total: u64,
     /// アプリケーションが消費したバイト数の合計 (MAX_DATA の前進基準)
@@ -278,9 +368,29 @@ pub(crate) struct StreamManager {
     /// ローカル起動の単方向ストリームの次のシーケンス番号
     next_local_uni: u64,
     /// 自エンドポイントが広告した、ピア起動の双方向ストリーム数の上限
+    ///
+    /// ピアへ実際に送信済み (MAX_STREAMS または QX_TRANSPORT_PARAMETERS) の値
+    /// だけを反映する。ピアがこの値を超えるストリームを開いた場合は
+    /// STREAM_LIMIT_ERROR とする (RFC 9000 Section 4.6)。
     local_max_streams_bidi: u64,
     /// 自エンドポイントが広告した、ピア起動の単方向ストリーム数の上限
+    ///
+    /// ピアへ実際に送信済みの値だけを反映する点は
+    /// `local_max_streams_bidi` と同じ。
     local_max_streams_uni: u64,
+    /// 次に広告する予定の、ピア起動の双方向ストリーム数の上限
+    ///
+    /// ストリームが終端するたびに増やし、MAX_STREAMS を送信した時点で
+    /// `local_max_streams_bidi` へ反映する。
+    planned_max_streams_bidi: u64,
+    /// 次に広告する予定の、ピア起動の単方向ストリーム数の上限
+    planned_max_streams_uni: u64,
+    /// 送信待ちの MAX_STREAMS (双方向) で広告する予定の上限
+    ///
+    /// 未送信の広告を重複して積まないための目印でもある。
+    pending_max_streams_bidi: Option<u64>,
+    /// 送信待ちの MAX_STREAMS (単方向) で広告する予定の上限
+    pending_max_streams_uni: Option<u64>,
     /// ピアが広告した、ローカル起動の双方向ストリーム数の上限
     peer_max_streams_bidi: u64,
     /// ピアが広告した、ローカル起動の単方向ストリーム数の上限
@@ -322,9 +432,13 @@ pub(crate) struct StreamManager {
     ///
     /// QX フレームや CONNECTION_CLOSE は [`crate::connection::Connection`] が
     /// ここへ直接追加する。
-    pub(crate) pending_frames: VecDeque<Vec<u8>>,
+    pub(crate) pending_frames: VecDeque<PendingFrame>,
     /// アプリケーションへ通知するイベント
     events: VecDeque<Event>,
+    /// 接続レベルのクレジットで書き込みが止まっているストリームを巡回する位置
+    ///
+    /// 少ない MAX_DATA の増加でも、特定のストリームだけに通知が偏らないようにする。
+    conn_blocked_cursor: Option<StreamId>,
 }
 
 impl StreamManager {
@@ -337,6 +451,10 @@ impl StreamManager {
             next_local_uni: 0,
             local_max_streams_bidi: local.initial_max_streams_bidi,
             local_max_streams_uni: local.initial_max_streams_uni,
+            planned_max_streams_bidi: local.initial_max_streams_bidi,
+            planned_max_streams_uni: local.initial_max_streams_uni,
+            pending_max_streams_bidi: None,
+            pending_max_streams_uni: None,
             peer_max_streams_bidi: 0,
             peer_max_streams_uni: 0,
             peer_bidi_created: 0,
@@ -360,6 +478,7 @@ impl StreamManager {
                 send_max_data: 0,
                 send_total: 0,
                 recv_max_data: local.initial_max_data,
+                pending_recv_max_data: None,
                 recv_total: 0,
                 consumed_total: 0,
                 recv_window: local.initial_max_data,
@@ -367,6 +486,7 @@ impl StreamManager {
             },
             pending_frames: VecDeque::new(),
             events: VecDeque::new(),
+            conn_blocked_cursor: None,
         }
     }
 
@@ -389,6 +509,131 @@ impl StreamManager {
     /// ピアが広告した QMux Record の Size の上限を返す
     pub(crate) fn peer_max_record_size(&self) -> u64 {
         self.peer_max_record_size
+    }
+
+    /// ピアが広告した双方向ストリーム数の上限を返す
+    pub(crate) fn peer_max_streams_bidi(&self) -> u64 {
+        self.peer_max_streams_bidi
+    }
+
+    /// ピアが広告した単方向ストリーム数の上限を返す
+    pub(crate) fn peer_max_streams_uni(&self) -> u64 {
+        self.peer_max_streams_uni
+    }
+
+    /// 接続レベルの送信クレジットの残量を返す
+    pub(crate) fn send_credit(&self) -> u64 {
+        self.flow.send_max_data.saturating_sub(self.flow.send_total)
+    }
+
+    /// ストリーム単位の送信クレジットの残量を返す
+    ///
+    /// 接続レベルのクレジットは含まない。実際に書き込める量は
+    /// [`StreamManager::send_credit`] との最小値になる。
+    pub(crate) fn stream_send_credit(&self, id: StreamId) -> Result<u64, Error> {
+        let Some(stream) = self.streams.get(&id) else {
+            return Err(self.unknown_or_closed_stream_error(id, true));
+        };
+        let Some(send_state) = stream.send_state else {
+            return Err(Error::Protocol {
+                code: TransportErrorCode::STREAM_STATE_ERROR,
+                reason: format!("stream {} is receive-only", id.as_u64()),
+            });
+        };
+        if send_state.is_terminal() {
+            return Err(Error::Protocol {
+                code: TransportErrorCode::STREAM_STATE_ERROR,
+                reason: format!("stream {} is closed for sending", id.as_u64()),
+            });
+        }
+        Ok(stream.send_max_data.saturating_sub(stream.send_offset))
+    }
+
+    /// フロー制御で書き込みが止まっているストリームがあるかどうか
+    ///
+    /// DATA_BLOCKED / STREAM_DATA_BLOCKED を送った上限のままクレジットが
+    /// 増えていない場合に `true` を返す。周期的な再送の要否の判定に使う。
+    pub(crate) fn has_blocked_flow(&self) -> bool {
+        let data_blocked = self.flow.last_data_blocked.is_some();
+        let stream_blocked = self.streams.values().any(|stream| {
+            stream.last_stream_data_blocked.is_some() && stream.send_state == Some(SendState::Ready)
+        });
+        data_blocked || stream_blocked
+    }
+
+    /// ブロック中のフロー制御通知を再送する (RFC 9000 Section 4.1)
+    ///
+    /// 同じ上限での重複送信を抑止するための `last_*` は変更しない。周期的な
+    /// 再送であることを呼び出し側が区別できるようにするためである。
+    pub(crate) fn resend_blocked_frames(&mut self) {
+        if self.flow.last_data_blocked.is_some() {
+            let blocked = frame::data_blocked::DataBlocked {
+                maximum_data: self.flow.send_max_data,
+            };
+            self.push_frame(&Frame::DataBlocked(blocked));
+        }
+        let blocked: Vec<(u64, u64)> = self
+            .streams
+            .values()
+            .filter(|stream| {
+                stream.last_stream_data_blocked.is_some()
+                    && stream.send_state == Some(SendState::Ready)
+            })
+            .map(|stream| (stream.id.as_u64(), stream.send_max_data))
+            .collect();
+        for (stream_id, maximum_stream_data) in blocked {
+            let blocked = frame::stream_data_blocked::StreamDataBlocked {
+                stream_id,
+                maximum_stream_data,
+            };
+            self.push_frame(&Frame::StreamDataBlocked(blocked));
+        }
+    }
+
+    /// 送信済みのフレームに付いた効果を適用する
+    ///
+    /// フレームが Record へ書き出された後にだけ呼び出す。これにより、内部の
+    /// 広告上限はピアが観測できる値より先行しない (RFC 9000 Section 4.6)。
+    pub(crate) fn apply_sent_effect(&mut self, effect: PendingEffect) {
+        match effect {
+            PendingEffect::DataLimitAdvanced(limit) => {
+                // 古いフレームが後から適用されても上限を巻き戻さない
+                self.flow.recv_max_data = core::cmp::max(self.flow.recv_max_data, limit);
+                if self.flow.pending_recv_max_data == Some(limit) {
+                    self.flow.pending_recv_max_data = None;
+                }
+                // 送信待ちの間にさらに消費されていれば、次の広告を積む
+                self.maybe_advance_conn_window();
+            }
+            PendingEffect::StreamWindowExtended { id, limit } => {
+                if let Some(stream) = self.streams.get_mut(&id) {
+                    stream.recv_max_data = core::cmp::max(stream.recv_max_data, limit);
+                    if stream.pending_recv_max_data == Some(limit) {
+                        stream.pending_recv_max_data = None;
+                    }
+                }
+                self.maybe_advance_stream_window(id);
+            }
+            PendingEffect::StreamsGranted {
+                bidirectional,
+                limit,
+            } => {
+                if bidirectional {
+                    self.local_max_streams_bidi =
+                        core::cmp::max(self.local_max_streams_bidi, limit);
+                    if self.pending_max_streams_bidi == Some(limit) {
+                        self.pending_max_streams_bidi = None;
+                    }
+                } else {
+                    self.local_max_streams_uni = core::cmp::max(self.local_max_streams_uni, limit);
+                    if self.pending_max_streams_uni == Some(limit) {
+                        self.pending_max_streams_uni = None;
+                    }
+                }
+                // 送信待ちの間にさらにストリームが終端していれば、次の広告を積む
+                self.refresh_max_streams(bidirectional);
+            }
+        }
     }
 
     /// アプリケーションへ通知するイベントを 1 つ取り出す
@@ -489,7 +734,9 @@ impl StreamManager {
                 last_stream_data_blocked: None,
                 recv_offset: 0,
                 read_offset: 0,
+                consumed_offset: 0,
                 recv_max_data,
+                pending_recv_max_data: None,
                 recv_window,
                 recv_buffer: VecDeque::new(),
                 final_size: None,
@@ -497,17 +744,16 @@ impl StreamManager {
                 readable_notified: false,
                 stop_sending_notified: false,
                 writable_notified: false,
+                conn_blocked: false,
+                stream_blocked: false,
+                local_stop_sending: false,
             },
         );
 
         if bidirectional {
             self.next_local_bidi += 1;
-            // アプリケーションがストリームを開いたので、上限増加を改めて通知できる
-            self.streams_available_notified_bidi = false;
         } else {
             self.next_local_uni += 1;
-            // アプリケーションがストリームを開いたので、上限増加を改めて通知できる
-            self.streams_available_notified_uni = false;
         }
         Ok(id)
     }
@@ -540,9 +786,6 @@ impl StreamManager {
                     reason: format!("stream {} is closed for sending", id.as_u64()),
                 });
             }
-            // アプリケーションが書き込みを試みたので、書き込み可能通知を改めて
-            // 送れるようにする (同じクレジットでの重複通知の抑止を解く)
-            stream.writable_notified = false;
             if data.is_empty() && !fin {
                 return Ok(0);
             }
@@ -558,8 +801,18 @@ impl StreamManager {
             // (RFC 9000 Section 19.8: FIN は最終サイズを示す)
             let send_fin = fin && len == data.len();
             if len == 0 && !send_fin {
+                // どちらのクレジットで止まったかを記録する。接続レベルの
+                // クレジットで止まったストリームは、MAX_DATA を受信したときに
+                // 通知対象を絞り込むために使う (1 バイトの増加で全ストリームへ
+                // 通知する増幅を避ける)。
+                stream.conn_blocked = conn_credit == 0;
+                stream.stream_blocked = stream_credit == 0;
                 (0, false, stream_credit, None)
             } else {
+                // 書き込みが進んだので、ブロック状態はいったん解消したとみなす。
+                // 再びクレジットが尽きた場合は次の write で記録し直す。
+                stream.conn_blocked = false;
+                stream.stream_blocked = false;
                 let frame = Frame::Stream(frame::stream::Stream {
                     stream_id: id.as_u64(),
                     offset: stream.send_offset,
@@ -600,7 +853,7 @@ impl StreamManager {
     pub(crate) fn read(&mut self, id: StreamId, buf: &mut [u8]) -> Result<ReadResult, Error> {
         // ストリームの状態更新をブロックに閉じ込め、借用をクレジット更新の
         // フレーム追加より先に終わらせる
-        let (result, max_stream_data, consumed, finished) = {
+        let (result, consumed, finished) = {
             let Some(stream) = self.streams.get_mut(&id) else {
                 // 終端して破棄したストリームへの読み取りは EOF を返す
                 // (アプリケーションは終端を先に観測している)
@@ -630,7 +883,6 @@ impl StreamManager {
                         ReadResult::Reset {
                             error_code: stream.reset_error_code.unwrap_or(0),
                         },
-                        None,
                         0,
                         true,
                     )
@@ -641,7 +893,6 @@ impl StreamManager {
                     ReadResult::Reset {
                         error_code: stream.reset_error_code.unwrap_or(0),
                     },
-                    None,
                     0,
                     true,
                 ),
@@ -655,23 +906,9 @@ impl StreamManager {
                         buf[index] = byte;
                     }
                     stream.read_offset += len as u64;
-
-                    // ストリーム単位のクレジット更新 (RFC 9000 Section 4.1)。
-                    // Recv 状態でのみ MAX_STREAM_DATA を送る
-                    // (最終サイズが確定した後は不要)。
-                    let mut max_stream_data = None;
-                    if len > 0 && recv_state == RecvState::Recv && stream.recv_window > 0 {
-                        let remaining = stream.recv_max_data - stream.read_offset;
-                        if remaining <= stream.recv_window / 2 {
-                            stream.recv_max_data = stream.read_offset + stream.recv_window;
-                            max_stream_data = Some(Frame::MaxStreamData(
-                                frame::max_stream_data::MaxStreamData {
-                                    stream_id: id.as_u64(),
-                                    maximum_stream_data: stream.recv_max_data,
-                                },
-                            ));
-                        }
-                    }
+                    // 読み取った分はフロー制御の消費済みとして数える。ウィンドウの
+                    // 前進は借用を終えた後にまとめて行う。
+                    stream.consumed_offset = stream.consumed_offset.saturating_add(len as u64);
 
                     // 未読のデータが残っている間は StreamReadable を再通知しない。
                     // 読み切ったら (read が len 0 を返すまで読んだら)、次のデータ
@@ -687,7 +924,6 @@ impl StreamManager {
                     }
                     (
                         ReadResult::Data { len, fin: finished },
-                        max_stream_data,
                         len as u64,
                         finished,
                     )
@@ -695,12 +931,14 @@ impl StreamManager {
             }
         };
 
-        if let Some(frame) = max_stream_data {
-            self.push_frame(&frame);
+        // ストリーム単位のクレジット更新 (RFC 9000 Section 4.1)。
+        // Recv 状態でのみ MAX_STREAM_DATA を送る (最終サイズが確定した後は不要)。
+        if consumed > 0 {
+            self.maybe_advance_stream_window(id);
         }
         // 接続レベルのクレジット更新 (RFC 9000 Section 4.1)
         if consumed > 0 {
-            self.flow.consumed_total += consumed;
+            self.flow.consumed_total = self.flow.consumed_total.saturating_add(consumed);
             self.maybe_advance_conn_window();
         }
         if finished {
@@ -743,8 +981,13 @@ impl StreamManager {
     }
 
     /// ストリームの受信側に STOP_SENDING を送る
+    ///
+    /// 送信後は、以後に到着する STREAM フレームのデータを破棄し、フロー制御の
+    /// 会計だけを行う (RFC 9000 Section 3.5)。破棄したデータの分もクレジットと
+    /// して直ちにピアへ返すため、ピアが RESET_STREAM を返すまで接続レベルの
+    /// ウィンドウが埋まり続けることはない。
     pub(crate) fn stop_sending(&mut self, id: StreamId, error_code: u64) -> Result<(), Error> {
-        let Some(stream) = self.streams.get(&id) else {
+        let Some(stream) = self.streams.get_mut(&id) else {
             return Err(self.unknown_or_closed_stream_error(id, false));
         };
         let Some(recv_state) = stream.recv_state else {
@@ -761,6 +1004,8 @@ impl StreamManager {
                 reason: format!("stream {} was already reset by the peer", id.as_u64()),
             });
         }
+        // アプリケーションは受信の継続をあきらめたため、以後のデータは破棄する
+        stream.local_stop_sending = true;
 
         let stop_sending = frame::stop_sending::StopSending {
             stream_id: id.as_u64(),
@@ -781,100 +1026,121 @@ impl StreamManager {
             return Ok(());
         }
 
-        let stream = self
-            .streams
-            .get_mut(&id)
-            .expect("stream was created or already existed");
-        let Some(recv_state) = stream.recv_state else {
-            // 送信専用ストリームへの STREAM フレームは STREAM_STATE_ERROR
-            // (RFC 9000 Section 19.8)
-            return Err(Error::Protocol {
-                code: TransportErrorCode::STREAM_STATE_ERROR,
-                reason: format!("stream {} is send-only", id.as_u64()),
-            });
-        };
-
-        // QMux Section 4.1: 直前の STREAM フレームのペイロードに連続しない
-        // ペイロードを持つ STREAM フレームを受信した場合は PROTOCOL_VIOLATION
-        if f.offset != stream.recv_offset {
-            return Err(Error::Protocol {
-                code: TransportErrorCode::PROTOCOL_VIOLATION,
-                reason: format!(
-                    "STREAM frame offset {} does not continue stream {} at {}",
-                    f.offset,
-                    id.as_u64(),
-                    stream.recv_offset
-                ),
-            });
-        }
-
-        let end = f
-            .offset
-            .checked_add(f.data.len() as u64)
-            .ok_or_else(|| Error::Protocol {
-                code: TransportErrorCode::FRAME_ENCODING_ERROR,
-                reason: format!("stream {} offset overflows", id.as_u64()),
-            })?;
-
-        // 最終サイズが確定している場合は、それを超えるデータを不正とする
-        // (RFC 9000 Section 4.5)
-        if let Some(final_size) = stream.final_size
-            && end > final_size
+        // データを破棄した場合に、借用を終えた後でフロー制御のクレジットを
+        // 返すために覚えておく。
+        let mut discarded = 0u64;
         {
-            return Err(Error::Protocol {
-                code: TransportErrorCode::FINAL_SIZE_ERROR,
-                reason: format!(
-                    "stream {} received data up to {end} beyond the final size {final_size}",
-                    id.as_u64()
-                ),
-            });
-        }
+            let stream = self
+                .streams
+                .get_mut(&id)
+                .expect("stream was created or already existed");
+            let Some(recv_state) = stream.recv_state else {
+                // 送信専用ストリームへの STREAM フレームは STREAM_STATE_ERROR
+                // (RFC 9000 Section 19.8)
+                return Err(Error::Protocol {
+                    code: TransportErrorCode::STREAM_STATE_ERROR,
+                    reason: format!("stream {} is send-only", id.as_u64()),
+                });
+            };
 
-        // フロー制御 (RFC 9000 Section 4.1)
-        if end > stream.recv_max_data {
-            return Err(Error::Protocol {
-                code: TransportErrorCode::FLOW_CONTROL_ERROR,
-                reason: format!(
-                    "stream {} received data up to {end} beyond the stream limit {}",
-                    id.as_u64(),
-                    stream.recv_max_data
-                ),
-            });
-        }
-        if self.flow.recv_total + f.data.len() as u64 > self.flow.recv_max_data {
-            return Err(Error::Protocol {
-                code: TransportErrorCode::FLOW_CONTROL_ERROR,
-                reason: format!(
-                    "connection received data beyond the connection limit {}",
-                    self.flow.recv_max_data
-                ),
-            });
-        }
+            // QMux Section 4.1: 直前の STREAM フレームのペイロードに連続しない
+            // ペイロードを持つ STREAM フレームを受信した場合は PROTOCOL_VIOLATION
+            if f.offset != stream.recv_offset {
+                return Err(Error::Protocol {
+                    code: TransportErrorCode::PROTOCOL_VIOLATION,
+                    reason: format!(
+                        "STREAM frame offset {} does not continue stream {} at {}",
+                        f.offset,
+                        id.as_u64(),
+                        stream.recv_offset
+                    ),
+                });
+            }
 
-        // RESET_STREAM を受信済みのストリームではデータを破棄するが、
-        // フロー制御の消費は数える (RFC 9000 Section 3.2)
-        let discard = matches!(recv_state, RecvState::ResetRecvd | RecvState::ResetRead);
-        self.flow.recv_total += f.data.len() as u64;
-        stream.recv_offset = end;
-        if discard {
-            return Ok(());
-        }
+            let end = f
+                .offset
+                .checked_add(f.data.len() as u64)
+                .ok_or_else(|| Error::Protocol {
+                    code: TransportErrorCode::FRAME_ENCODING_ERROR,
+                    reason: format!("stream {} offset overflows", id.as_u64()),
+                })?;
 
-        if !f.data.is_empty() {
-            stream.recv_buffer.extend(f.data.iter().copied());
-        }
-        if f.fin {
-            stream.final_size = Some(end);
-            if recv_state == RecvState::Recv {
-                stream.recv_state = Some(RecvState::SizeKnown);
+            // 最終サイズが確定している場合は、それを超えるデータを不正とする
+            // (RFC 9000 Section 4.5)
+            if let Some(final_size) = stream.final_size
+                && end > final_size
+            {
+                return Err(Error::Protocol {
+                    code: TransportErrorCode::FINAL_SIZE_ERROR,
+                    reason: format!(
+                        "stream {} received data up to {end} beyond the final size {final_size}",
+                        id.as_u64()
+                    ),
+                });
+            }
+
+            // フロー制御 (RFC 9000 Section 4.1)。STOP_SENDING を送った後でも、
+            // 到着したデータはフロー制御に数える (RFC 9000 Section 3.5)。
+            if end > stream.recv_max_data {
+                return Err(Error::Protocol {
+                    code: TransportErrorCode::FLOW_CONTROL_ERROR,
+                    reason: format!(
+                        "stream {} received data up to {end} beyond the stream limit {}",
+                        id.as_u64(),
+                        stream.recv_max_data
+                    ),
+                });
+            }
+            if self.flow.recv_total.saturating_add(f.data.len() as u64) > self.flow.recv_max_data {
+                return Err(Error::Protocol {
+                    code: TransportErrorCode::FLOW_CONTROL_ERROR,
+                    reason: format!(
+                        "connection received data beyond the connection limit {}",
+                        self.flow.recv_max_data
+                    ),
+                });
+            }
+
+            // RESET_STREAM を受信済みのストリーム、およびローカルで STOP_SENDING を
+            // 送信済みのストリームではデータを破棄するが、フロー制御の消費は数える
+            // (RFC 9000 Section 3.2, Section 3.5)。
+            let discard = matches!(recv_state, RecvState::ResetRecvd | RecvState::ResetRead)
+                || stream.local_stop_sending;
+            self.flow.recv_total = self.flow.recv_total.saturating_add(f.data.len() as u64);
+            stream.recv_offset = end;
+            if f.fin {
+                stream.final_size = Some(end);
+                if recv_state == RecvState::Recv {
+                    stream.recv_state = Some(RecvState::SizeKnown);
+                }
+            }
+            if discard {
+                // データを破棄した分はアプリケーションが消費しないため、受信側の
+                // 消費済みオフセットへ進めてクレジットを返す
+                // (RFC 9000 Section 3.5)。
+                stream.consumed_offset = stream.consumed_offset.saturating_add(f.data.len() as u64);
+                discarded = f.data.len() as u64;
+            } else {
+                if !f.data.is_empty() {
+                    stream.recv_buffer.extend(f.data.iter().copied());
+                }
+                // データと FIN のどちらも、アプリケーションにとっては読み取りの
+                // 契機になる。空の FIN だけのフレームでも通知しないと、
+                // アプリケーションが終端を観測できない
+                // (RFC 9000 Section 19.8: FIN は最終サイズを示す)。
+                if (!f.data.is_empty() || f.fin) && !stream.readable_notified {
+                    stream.readable_notified = true;
+                    self.events.push_back(Event::StreamReadable { id });
+                }
             }
         }
-        // データと FIN のどちらも、アプリケーションにとっては読み取りの契機になる。
-        // 空の FIN だけのフレームでも通知しないと、アプリケーションが終端を
-        // 観測できない (RFC 9000 Section 19.8: FIN は最終サイズを示す)。
-        if (!f.data.is_empty() || f.fin) && !stream.readable_notified {
-            stream.readable_notified = true;
-            self.events.push_back(Event::StreamReadable { id });
+
+        if discarded > 0 {
+            // 破棄したデータのクレジットを直ちに返す。ストリーム単位と接続単位の
+            // 両方で、未送信の広告があれば重複して積まない。
+            self.flow.consumed_total = self.flow.consumed_total.saturating_add(discarded);
+            self.maybe_advance_stream_window(id);
+            self.maybe_advance_conn_window();
         }
         Ok(())
     }
@@ -943,7 +1209,7 @@ impl StreamManager {
             });
         }
         let additional = f.final_size - stream.recv_offset;
-        if self.flow.recv_total + additional > self.flow.recv_max_data {
+        if self.flow.recv_total.saturating_add(additional) > self.flow.recv_max_data {
             return Err(Error::Protocol {
                 code: TransportErrorCode::FLOW_CONTROL_ERROR,
                 reason: format!(
@@ -964,14 +1230,16 @@ impl StreamManager {
             return Ok(());
         }
 
-        self.flow.recv_total += additional;
+        self.flow.recv_total = self.flow.recv_total.saturating_add(additional);
         stream.recv_offset = f.final_size;
         stream.final_size = Some(f.final_size);
         stream.reset_error_code = Some(f.application_protocol_error_code);
         // 破棄するデータとリセットで確定した分はアプリケーションが消費しないため、
         // 接続レベルのクレジットとして返却する。返却しないとウィンドウが
         // 解放されず、ピアが接続レベルのフロー制御で恒久的にブロックされる。
-        self.flow.consumed_total += additional + stream.recv_buffer.len() as u64;
+        let abandoned = additional.saturating_add(stream.recv_buffer.len() as u64);
+        self.flow.consumed_total = self.flow.consumed_total.saturating_add(abandoned);
+        stream.consumed_offset = f.final_size;
         stream.recv_buffer.clear();
         stream.recv_state = Some(RecvState::ResetRecvd);
         self.maybe_advance_conn_window();
@@ -1045,34 +1313,66 @@ impl StreamManager {
         if maximum_data <= self.flow.send_max_data {
             return;
         }
-        let previous_limit = self.flow.send_max_data;
+        let increase = maximum_data - self.flow.send_max_data;
         self.flow.send_max_data = maximum_data;
         self.flow.last_data_blocked = None;
 
-        // 接続レベルのクレジットで止まっていたストリームをアプリケーションへ通知する。
-        // send_offset >= previous_limit は「直前の接続上限に達していた」ことの近似で
-        // あり、複数ストリームでクレジットを分け合っている場合、send_offset が上限
-        // 未満でも接続クレジットで止まっているストリームを取りこぼしうる。通知は
-        // 助言であり、アプリが write を再試行すれば進むため、ここでは近似的に絞る。
-        // 同じストリームへの通知が未配送のまま残っている場合は積み増さない
-        // (draft-ietf-quic-qmux-02 Section 12.2 は小さなフロー制御更新の連投を
-        //  資源消費の例として挙げている)。
-        let writable: Vec<StreamId> = self
+        // 接続レベルのクレジットで止まっていたストリームだけを通知する。
+        // write が接続クレジット 0 で 0 バイトを返した時点で印を付けているため、
+        // 複数ストリームがクレジットを分け合って止まっている場合も取りこぼさない
+        // (send_offset と旧上限の比較では取りこぼす)。
+        //
+        // 通知数はクレジットの増分 (バイト数) で上限を設ける。1 バイトの
+        // MAX_DATA で全停止ストリームへ通知すると、小さなフレーム 1 個で
+        // ストリーム数に比例したイベントが発生する (draft-ietf-quic-qmux-02
+        // Section 12.2 が例示する資源消費パターン)。増分 1 バイトにつき
+        // 1 ストリームまでなら、通知を受けたストリームは少なくとも 1 バイトを
+        // 書き込める見込みがあり、入力に対する増幅率は 1 倍に収まる。
+        let budget = usize::try_from(increase).unwrap_or(usize::MAX);
+        let candidates = self.conn_blocked_candidates(budget);
+        for id in candidates {
+            if let Some(stream) = self.streams.get_mut(&id) {
+                // 印は通知のたびに消す。次に接続クレジット 0 で書き込みが
+                // 止まったときに付け直される。
+                stream.conn_blocked = false;
+                // 同じストリームへの通知が未配送のまま残っている場合は積み増さない
+                // (draft-ietf-quic-qmux-02 Section 12.2)。
+                if !stream.writable_notified {
+                    stream.writable_notified = true;
+                    self.events.push_back(Event::StreamWritable { id });
+                }
+                self.conn_blocked_cursor = Some(id);
+            }
+        }
+    }
+
+    /// 接続レベルのクレジットで止まっているストリームを最大 `budget` 個返す
+    ///
+    /// ストリーム単位のクレジットも 0 のストリームは、接続クレジットが増えても
+    /// 書き込めないため除外する。前回通知したストリームの次から巡回し、増分が
+    /// 小さいときに特定のストリームだけが通知され続けることを避ける。
+    fn conn_blocked_candidates(&self, budget: usize) -> Vec<StreamId> {
+        if budget == 0 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<StreamId> = self
             .streams
             .values()
-            .filter(|s| {
-                s.send_state == Some(SendState::Ready)
-                    && s.send_offset >= previous_limit
-                    && !s.writable_notified
+            .filter(|stream| {
+                stream.conn_blocked
+                    && stream.send_state == Some(SendState::Ready)
+                    && stream.send_max_data > stream.send_offset
             })
-            .map(|s| s.id)
+            .map(|stream| stream.id)
             .collect();
-        for id in writable {
-            if let Some(stream) = self.streams.get_mut(&id) {
-                stream.writable_notified = true;
+        if let Some(cursor) = self.conn_blocked_cursor {
+            // 前回通知したストリームより大きい ID から始め、末尾に達したら先頭へ戻る
+            if let Some(position) = candidates.iter().position(|id| *id > cursor) {
+                candidates.rotate_left(position);
             }
-            self.events.push_back(Event::StreamWritable { id });
         }
+        candidates.truncate(budget);
+        candidates
     }
 
     /// MAX_STREAM_DATA フレームを受信する (RFC 9000 Section 19.10)
@@ -1107,6 +1407,8 @@ impl StreamManager {
         }
         stream.send_max_data = f.maximum_stream_data;
         stream.last_stream_data_blocked = None;
+        // ストリーム単位のクレジットが戻ったので、周期再送の対象から外す
+        stream.stream_blocked = false;
         // 送信側が終端したストリームには通知しない (on_max_data と同じ条件)。
         // また、同じストリームへの通知が未配送のまま残っている場合は積み増さない
         // (draft-ietf-quic-qmux-02 Section 12.2 は小さなフロー制御更新の連投を
@@ -1282,8 +1584,11 @@ impl StreamManager {
         let bidirectional = stream_type.is_bidirectional();
         let sequence = id.sequence();
 
-        // 自エンドポイントが広告した上限を超えるストリームを開こうとした場合は
-        // STREAM_LIMIT_ERROR (RFC 9000 Section 4.6)
+        // 自エンドポイントがピアへ送信した MAX_STREAMS の上限を超えるストリームを
+        // 開こうとした場合は STREAM_LIMIT_ERROR (RFC 9000 Section 4.6)。
+        // 送信待ちの MAX_STREAMS はまだ送信済みではないため、ここには反映しない。
+        // 送信待ちの広告値は apply_sent_effect で Record へ書き出した時点で
+        // local_max_streams_* に反映される。
         let limit = if bidirectional {
             self.local_max_streams_bidi
         } else {
@@ -1362,7 +1667,9 @@ impl StreamManager {
                 last_stream_data_blocked: None,
                 recv_offset: 0,
                 read_offset: 0,
+                consumed_offset: 0,
                 recv_max_data,
+                pending_recv_max_data: None,
                 recv_window,
                 recv_buffer: VecDeque::new(),
                 final_size: None,
@@ -1370,6 +1677,9 @@ impl StreamManager {
                 readable_notified: false,
                 stop_sending_notified: false,
                 writable_notified: false,
+                conn_blocked: false,
+                stream_blocked: false,
+                local_stop_sending: false,
             },
         );
     }
@@ -1382,6 +1692,10 @@ impl StreamManager {
     /// MAX_STREAMS を送り、同時に開けるストリーム数は初期値のまま保つ。
     /// 破棄したストリームへのフレームは [`StreamManager::was_created`] で判別して
     /// 破棄する。
+    ///
+    /// 上限の増加は「広告する予定の値」として記録し、MAX_STREAMS が実際に
+    /// Record へ書き出された時点で送信済みの上限へ反映する (RFC 9000 Section 4.6
+    /// の「the limit it has sent」を基準にするため)。
     fn finish_stream(&mut self, id: StreamId) {
         let Some(stream) = self.streams.get(&id) else {
             return;
@@ -1395,28 +1709,62 @@ impl StreamManager {
         if !peer_initiated {
             return;
         }
-        // 上限を増やしてから MAX_STREAMS を送るため、内部カウンタはピアが観測した
-        // 「送信済みの上限」より先行して増える。ピアがその上限を超えてストリームを
-        // 開いた場合、RFC 9000 Section 4.6 の「the limit it has sent」の厳密な解釈
-        // では STREAM_LIMIT_ERROR とすべきだが、本実装は create_peer_streams で
-        // 先行した local_max_streams_* と比較するため受理する (寛容側。エラーに
-        // しない判断である)。
-        let maximum_streams = if id.stream_type().is_bidirectional() {
+        let bidirectional = id.stream_type().is_bidirectional();
+        if bidirectional {
             // RFC 9000 Section 4.6: 2^60 を超える上限は送信できないため飽和させる
-            self.local_max_streams_bidi = (self.local_max_streams_bidi + 1).min(MAX_STREAMS_LIMIT);
-            frame::max_streams::MaxStreams {
-                bidirectional: true,
-                maximum_streams: self.local_max_streams_bidi,
-            }
+            self.planned_max_streams_bidi = self
+                .planned_max_streams_bidi
+                .saturating_add(1)
+                .min(MAX_STREAMS_LIMIT);
         } else {
-            // RFC 9000 Section 4.6: 2^60 を超える上限は送信できないため飽和させる
-            self.local_max_streams_uni = (self.local_max_streams_uni + 1).min(MAX_STREAMS_LIMIT);
-            frame::max_streams::MaxStreams {
-                bidirectional: false,
-                maximum_streams: self.local_max_streams_uni,
-            }
+            self.planned_max_streams_uni = self
+                .planned_max_streams_uni
+                .saturating_add(1)
+                .min(MAX_STREAMS_LIMIT);
+        }
+        self.refresh_max_streams(bidirectional);
+    }
+
+    /// 送信待ちの MAX_STREAMS を必要に応じて積む
+    ///
+    /// 広告予定の上限が送信済みの上限より大きく、かつ同じ方向の未送信フレームが
+    /// ないときだけ積む。フレームが書き出された時点で
+    /// [`StreamManager::apply_sent_effect`] が送信済みの上限を更新する。
+    fn refresh_max_streams(&mut self, bidirectional: bool) {
+        let (announced, planned, pending) = if bidirectional {
+            (
+                self.local_max_streams_bidi,
+                self.planned_max_streams_bidi,
+                self.pending_max_streams_bidi,
+            )
+        } else {
+            (
+                self.local_max_streams_uni,
+                self.planned_max_streams_uni,
+                self.pending_max_streams_uni,
+            )
         };
-        self.push_frame(&Frame::MaxStreams(maximum_streams));
+        if planned <= announced || pending.is_some() {
+            return;
+        }
+        let maximum_streams = frame::max_streams::MaxStreams {
+            bidirectional,
+            maximum_streams: planned,
+        };
+        let mut encoded = Vec::new();
+        Frame::MaxStreams(maximum_streams).encode(&mut encoded);
+        self.pending_frames.push_back(PendingFrame::with_effect(
+            encoded,
+            PendingEffect::StreamsGranted {
+                bidirectional,
+                limit: planned,
+            },
+        ));
+        if bidirectional {
+            self.pending_max_streams_bidi = Some(planned);
+        } else {
+            self.pending_max_streams_uni = Some(planned);
+        }
     }
 
     /// 送信がブロックされたことをピアへ通知する (RFC 9000 Section 4.1)
@@ -1453,25 +1801,92 @@ impl StreamManager {
     /// 未読のデータがウィンドウの半分以下になったら、消費済みバイト数を基準に
     /// クレジットを追加する。消費済み基準にすることで、アプリケーションが
     /// 読み取らない限りウィンドウが広がらず、受信バッファが積み上がらない。
+    ///
+    /// 広告値は可変長整数の上限 (2^62-1) で飽和させる。`consumed_total` と
+    /// `recv_window` の和が上限を超えても panic しない (RFC 9000 Section 16)。
+    /// 新しい上限は送信済みの上限と比較して広告する (RFC 9000 Section 4.6)。
     fn maybe_advance_conn_window(&mut self) {
         if self.flow.recv_window == 0 {
             return;
         }
-        let remaining = self.flow.recv_max_data - self.flow.consumed_total;
-        if remaining <= self.flow.recv_window / 2 {
-            self.flow.recv_max_data = self.flow.consumed_total + self.flow.recv_window;
-            let max_data = frame::max_data::MaxData {
-                maximum_data: self.flow.recv_max_data,
-            };
-            self.push_frame(&Frame::MaxData(max_data));
+        // 未送信の広告がある間は、それより小さい/重複した広告を積まない
+        if self.flow.pending_recv_max_data.is_some() {
+            return;
         }
+        let remaining = self
+            .flow
+            .recv_max_data
+            .saturating_sub(self.flow.consumed_total);
+        if remaining > self.flow.recv_window / 2 {
+            return;
+        }
+        let next = self
+            .flow
+            .consumed_total
+            .saturating_add(self.flow.recv_window)
+            .min(MAX_VALUE);
+        // 上限を増やさない広告は送らない (RFC 9000 Section 4.1)
+        if next <= self.flow.recv_max_data {
+            return;
+        }
+        self.flow.pending_recv_max_data = Some(next);
+        let max_data = frame::max_data::MaxData { maximum_data: next };
+        let mut encoded = Vec::new();
+        Frame::MaxData(max_data).encode(&mut encoded);
+        self.pending_frames.push_back(PendingFrame::with_effect(
+            encoded,
+            PendingEffect::DataLimitAdvanced(next),
+        ));
     }
 
-    /// フレームをエンコードして送信待ちに追加する
+    /// ストリーム単位の受信ウィンドウを消費済みバイト数に応じて前進させる
+    ///
+    /// 閾値と飽和の扱いは [`StreamManager::maybe_advance_conn_window`] と同じ。
+    /// 最終サイズが確定した後 (SizeKnown / Reset*) は MAX_STREAM_DATA が不要な
+    /// ため何もしない (RFC 9000 Section 4.1)。
+    fn maybe_advance_stream_window(&mut self, id: StreamId) {
+        let next = {
+            let Some(stream) = self.streams.get_mut(&id) else {
+                return;
+            };
+            if stream.recv_window == 0 || stream.pending_recv_max_data.is_some() {
+                return;
+            }
+            if stream.recv_state != Some(RecvState::Recv) {
+                return;
+            }
+            let remaining = stream.recv_max_data.saturating_sub(stream.consumed_offset);
+            if remaining > stream.recv_window / 2 {
+                return;
+            }
+            let next = stream
+                .consumed_offset
+                .saturating_add(stream.recv_window)
+                .min(MAX_VALUE);
+            // 上限を増やさない広告は送らない (RFC 9000 Section 4.1)
+            if next <= stream.recv_max_data {
+                return;
+            }
+            stream.pending_recv_max_data = Some(next);
+            next
+        };
+        let max_stream_data = frame::max_stream_data::MaxStreamData {
+            stream_id: id.as_u64(),
+            maximum_stream_data: next,
+        };
+        let mut encoded = Vec::new();
+        Frame::MaxStreamData(max_stream_data).encode(&mut encoded);
+        self.pending_frames.push_back(PendingFrame::with_effect(
+            encoded,
+            PendingEffect::StreamWindowExtended { id, limit: next },
+        ));
+    }
+
+    /// フレームをエンコードして送信待ちに追加する (送信時の効果なし)
     fn push_frame(&mut self, frame: &Frame) {
         let mut encoded = Vec::new();
         frame.encode(&mut encoded);
-        self.pending_frames.push_back(encoded);
+        self.pending_frames.push_back(PendingFrame::new(encoded));
     }
 }
 
@@ -1492,4 +1907,112 @@ fn varint_size(value: u64) -> usize {
     VarInt::try_from(value)
         .expect("value fits in a variable-length integer")
         .encoded_size()
+}
+
+#[cfg(test)]
+mod tests {
+    //! フロー制御の広告値計算と MAX_STREAMS の飽和の単体テスト。
+    //!
+    //! 公開 API からは 2^62 バイト規模の受信や 2^60 回のストリーム終端を
+    //! 発生させられないため、境界の計算だけをここで固定する。
+
+    use super::*;
+    use crate::codec::role::Role;
+
+    #[test]
+    fn advancing_connection_window_saturates_at_varint_max() {
+        // 可変長整数の上限に近い受信ウィンドウを設定する。旧実装は
+        // consumed_total + recv_window が 2^62-1 を超え、MAX_DATA のエンコードで
+        // panic した (RFC 9000 Section 16)。
+        let local = TransportParameters {
+            initial_max_data: MAX_VALUE,
+            ..TransportParameters::default()
+        };
+        let mut manager = StreamManager::new(Role::Client, &local);
+        manager.flow.recv_max_data = MAX_VALUE / 2;
+        manager.flow.recv_window = MAX_VALUE;
+        manager.flow.consumed_total = MAX_VALUE / 2 - 1;
+
+        manager.maybe_advance_conn_window();
+
+        assert_eq!(
+            manager.flow.pending_recv_max_data,
+            Some(MAX_VALUE),
+            "広告値は可変長整数の上限で飽和すること"
+        );
+        assert_eq!(
+            manager.pending_frames.len(),
+            1,
+            "飽和した広告値を 1 件だけ積むこと"
+        );
+        assert_eq!(
+            manager.pending_frames[0].effect,
+            Some(PendingEffect::DataLimitAdvanced(MAX_VALUE)),
+            "送信時に適用する効果を持つこと"
+        );
+    }
+
+    #[test]
+    fn advancing_stream_window_saturates_at_varint_max() {
+        let local = TransportParameters {
+            initial_max_stream_data_bidi_remote: MAX_VALUE,
+            ..TransportParameters::default()
+        };
+        let mut manager = StreamManager::new(Role::Client, &local);
+        let id = StreamId::new(0).expect("ストリーム ID を作れる");
+        manager.insert_peer_stream(id);
+        let stream = manager.streams.get_mut(&id).expect("ストリームがある");
+        stream.recv_max_data = MAX_VALUE / 2;
+        stream.recv_window = MAX_VALUE;
+        stream.consumed_offset = MAX_VALUE / 2 - 1;
+
+        manager.maybe_advance_stream_window(id);
+
+        let stream = manager.streams.get(&id).expect("ストリームがある");
+        assert_eq!(
+            stream.pending_recv_max_data,
+            Some(MAX_VALUE),
+            "広告値は可変長整数の上限で飽和すること"
+        );
+        assert_eq!(
+            manager.pending_frames[0].effect,
+            Some(PendingEffect::StreamWindowExtended {
+                id,
+                limit: MAX_VALUE
+            }),
+            "送信時に適用する効果を持つこと"
+        );
+    }
+
+    #[test]
+    fn max_streams_announcement_saturates_at_2_60() {
+        // RFC 9000 Section 4.6: MAX_STREAMS で広告できる上限は 2^60 まで
+        let local = TransportParameters {
+            initial_max_streams_bidi: MAX_STREAMS_LIMIT - 1,
+            ..TransportParameters::default()
+        };
+        let mut manager = StreamManager::new(Role::Client, &local);
+        manager.planned_max_streams_bidi = MAX_STREAMS_LIMIT;
+        manager.refresh_max_streams(true);
+
+        let effect = manager.pending_frames[0]
+            .effect
+            .expect("MAX_STREAMS は送信時の効果を持つ");
+        manager.apply_sent_effect(effect);
+
+        assert_eq!(
+            manager.local_max_streams_bidi, MAX_STREAMS_LIMIT,
+            "送信済みの上限が 2^60 で飽和すること"
+        );
+        manager.planned_max_streams_bidi = manager
+            .planned_max_streams_bidi
+            .saturating_add(1)
+            .min(MAX_STREAMS_LIMIT);
+        manager.refresh_max_streams(true);
+        assert_eq!(
+            manager.pending_frames.len(),
+            1,
+            "2^60 に達した後は MAX_STREAMS を積み増さないこと"
+        );
+    }
 }

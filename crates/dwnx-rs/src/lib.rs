@@ -12,6 +12,8 @@ mod error;
 mod event;
 
 pub use config::{MAX_CONFIG_STREAMS, TransportParameters};
-pub use connection::{Connection, DatagramEvent, WriteEvent};
+pub use connection::{
+    Connection, DatagramEvent, MAX_PENDING_DATAGRAM_BYTES, MAX_PENDING_DATAGRAMS, WriteEvent,
+};
 pub use error::Error;
 pub use event::Event;

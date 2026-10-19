@@ -60,7 +60,10 @@ pub(crate) enum Command {
     /// dwnx が Record に収め、下位トランスポートへ書き出し終えた時点で `ack` へ
     /// 結果を返す。ピアが DATAGRAM 拡張を広告していない場合、フレームがピアの
     /// `max_datagram_frame_size` を超える場合、またはローカルの Record 容量に
-    /// 収まらない場合は `ack` にエラーを返す。
+    /// 収まらない場合は `ack` にエラーを返す。送信待ちの DATAGRAM が
+    /// [`dwnx_rs::MAX_PENDING_DATAGRAMS`] 件または
+    /// [`dwnx_rs::MAX_PENDING_DATAGRAM_BYTES`] バイトに達した場合も、積まずに
+    /// [`Error::DatagramQueueFull`] を `ack` へ返す。
     Datagram {
         /// 送信するデータ
         data: Vec<u8>,
@@ -164,8 +167,8 @@ pub const DEFAULT_LINGER: Duration = Duration::from_secs(3);
 ///
 /// 下位トランスポートを所有するドライバタスクを起動する。[`Connection`] を
 /// ドロップすると close 要求チャネルの送信側が閉じ、ドライバは下位トランスポートを
-/// 閉じて終了する。ストリームのハンドルが残っていても、ドライバ自身がコマンドの
-/// 送信側を保持するため、コマンドチャネルは閉じない。
+/// 閉じて終了する (linger は待たない)。ストリームのハンドルが残っていても、ドライバ
+/// 自身がコマンド送信側を保持するため、コマンドチャネルは閉じない。
 #[derive(Debug)]
 pub struct Connection {
     /// ドライバへのコマンド送信
@@ -386,6 +389,11 @@ impl Connection {
     /// [`Error::Dwnx`] を返す (RFC 9221 Section 3、draft-ietf-quic-qmux-02
     /// Section 9.1)。DATAGRAM は Record として届くが、受信側が速やかに
     /// 受け取れない場合は破棄されうる。
+    ///
+    /// 送信待ちの DATAGRAM には上限がある ([`dwnx_rs::MAX_PENDING_DATAGRAMS`]
+    /// 件、[`dwnx_rs::MAX_PENDING_DATAGRAM_BYTES`] バイト)。上限に達している間に
+    /// 呼ぶと、積まずに [`Error::DatagramQueueFull`] を返す。送信待ちが減ってから
+    /// 送り直すこと。
     pub async fn send_datagram(&self, data: &[u8]) -> Result<()> {
         let (ack, receive) = oneshot::channel();
         self.commands
@@ -1183,9 +1191,16 @@ impl Driver {
                 let _ = self.connection.shutdown_read(id, error_code);
             }
             Command::Datagram { data, ack } => {
-                // 接続が閉じている場合は送信されないため、ここで失敗を返す
+                // 接続が閉じている場合と送信待ちの上限に達している場合は、
+                // DATAGRAM が積まれずに false が返る。呼び出し側が再試行できる
+                // よう、理由の分かるエラーを返す。
                 if !self.connection.send_datagram(&data) {
-                    let _ = ack.send(Err(Error::ConnectionClosed));
+                    let error = if self.connection.is_closed() {
+                        Error::ConnectionClosed
+                    } else {
+                        Error::DatagramQueueFull
+                    };
+                    let _ = ack.send(Err(error));
                     return;
                 }
                 self.pending_datagram_acks.push_back(ack);

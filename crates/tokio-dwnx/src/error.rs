@@ -11,6 +11,11 @@ pub enum Error {
     Io(std::io::Error),
     /// 接続が閉じた
     ConnectionClosed,
+    /// 送信待ちの DATAGRAM が上限に達した
+    ///
+    /// [`crate::Connection::send_datagram`] が積もうとした DATAGRAM は送信されて
+    /// いない。送信待ちが減ってから送り直すこと。
+    DatagramQueueFull,
     /// ピアがストリームをリセットした
     Reset(u64),
 }
@@ -21,6 +26,7 @@ impl fmt::Display for Error {
             Self::Dwnx(error) => write!(f, "dwnx error: {error}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::ConnectionClosed => write!(f, "connection is closed"),
+            Self::DatagramQueueFull => write!(f, "datagram send queue is full"),
             Self::Reset(code) => write!(f, "stream was reset by the peer (error code {code})"),
         }
     }

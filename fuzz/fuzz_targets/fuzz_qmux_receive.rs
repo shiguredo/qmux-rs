@@ -106,8 +106,10 @@ fn feed(role: Role, data: &[u8], now: Timestamp) {
         conn.handle_timeout(deadline);
     }
 
-    // 切断と、CONNECTION_CLOSE を書き出す経路
-    conn.close(0, "fuzz");
+    // 切断と、CONNECTION_CLOSE を書き出す経路。
+    // error_code 0 は可変長整数の範囲内なので close は成功する
+    conn.close(0, "fuzz")
+        .expect("error_code 0 は可変長整数の範囲内である");
     drain(&mut conn, now);
 }
 

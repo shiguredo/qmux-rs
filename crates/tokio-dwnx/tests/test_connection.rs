@@ -26,8 +26,9 @@ const TEST_LINGER: Duration = Duration::from_millis(100);
 /// 送信側の shutdown を判別するテストで使う linger の上限
 ///
 /// shutdown を送らない実装では、ピアが EOF を観測するのはこの期限の満了時点に
-/// なる。期限を長くとることで、shutdown が期限を待たずに届くことを判別できる。
-const SHUTDOWN_LINGER: Duration = Duration::from_secs(2);
+/// なる。期限を待ち合わせの上限 (GUARD) より十分長くとることで、GUARD の時間内に
+/// 終了したかどうかで shutdown が期限を待たずに届いたことを判別できる。
+const SHUTDOWN_LINGER: Duration = Duration::from_secs(30);
 
 /// テスト用の設定
 ///
@@ -136,6 +137,98 @@ async fn bidirectional_data_transfer() {
     server_send.finish().await.expect("サーバーが FIN を送れる");
     let echoed = read_to_end(&mut recv).await;
     assert_eq!(echoed, data, "クライアントがエコーを受け取ること");
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn unidirectional_data_transfer() {
+    // クライアントが単方向ストリームを開き、サーバーが accept してデータと
+    // FIN を受け取ること。ハンドルをドロップした後も接続が使えることを確認する。
+    let (client, server) = connect(DEFAULT_LINGER);
+
+    // クライアントが単方向ストリームを開いてデータと FIN を送る
+    let mut send = tokio::time::timeout(GUARD, client.open_unidirectional())
+        .await
+        .expect("guard の時間内に開ける")
+        .expect("単方向ストリームを開ける");
+    let stream_id = send.id();
+    send.write(b"hello uni")
+        .await
+        .expect("クライアントが書き込める");
+    send.finish().await.expect("クライアントが FIN を送れる");
+
+    // サーバーが単方向ストリームを受け取り、データと FIN を読む
+    let mut recv = tokio::time::timeout(GUARD, server.accept_unidirectional())
+        .await
+        .expect("guard の時間内に accept できる")
+        .expect("単方向ストリームが届く");
+    assert_eq!(recv.id(), stream_id, "同じストリーム ID であること");
+    assert_eq!(
+        read_to_end(&mut recv).await,
+        b"hello uni",
+        "サーバーがデータと FIN を受け取ること"
+    );
+
+    // 終端したハンドルをドロップしても接続は閉じない。別のストリームが使えること
+    drop(send);
+    drop(recv);
+    let (mut next_send, _next_recv) = tokio::time::timeout(GUARD, client.open_bidirectional())
+        .await
+        .expect("guard の時間内に開ける")
+        .expect("ハンドルのドロップ後もストリームを開ける");
+    next_send
+        .write(b"after drop")
+        .await
+        .expect("ハンドルのドロップ後も書き込める");
+    next_send
+        .finish()
+        .await
+        .expect("ハンドルのドロップ後も FIN を送れる");
+
+    let (_, mut next_server_recv) = tokio::time::timeout(GUARD, server.accept_bidirectional())
+        .await
+        .expect("guard の時間内に accept できる")
+        .expect("次のストリームが届く");
+    assert_eq!(
+        read_to_end(&mut next_server_recv).await,
+        b"after drop",
+        "ハンドルのドロップ後もデータが届くこと"
+    );
+
+    close_and_wait(&client, 0, "done").await;
+    close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn server_unidirectional_data_transfer() {
+    // 逆方向でも単方向ストリームが使えること。サーバーが開き、クライアントが
+    // accept してデータと FIN を受け取る。
+    let (client, server) = connect(DEFAULT_LINGER);
+
+    let mut send = tokio::time::timeout(GUARD, server.open_unidirectional())
+        .await
+        .expect("guard の時間内に開ける")
+        .expect("サーバーが単方向ストリームを開ける");
+    let stream_id = send.id();
+    send.write(b"hello from server")
+        .await
+        .expect("サーバーが書き込める");
+    send.finish().await.expect("サーバーが FIN を送れる");
+
+    let mut recv = tokio::time::timeout(GUARD, client.accept_unidirectional())
+        .await
+        .expect("guard の時間内に accept できる")
+        .expect("単方向ストリームが届く");
+    assert_eq!(recv.id(), stream_id, "同じストリーム ID であること");
+    assert_eq!(
+        read_to_end(&mut recv).await,
+        b"hello from server",
+        "クライアントがデータと FIN を受け取ること"
+    );
+    drop(send);
+    drop(recv);
 
     close_and_wait(&client, 0, "done").await;
     close_and_wait(&server, 0, "done").await;
@@ -455,15 +548,24 @@ async fn deferred_delivery_resumes_while_app_reads() {
         server_send.finish().await.expect("サーバーが FIN を送れる");
     });
 
-    // クライアントはまず読まない。これで配送待ちのキューが埋まる
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // クライアントはまず 1 バイトだけ読む。データの配送が始まったことを確認して
+    // から、残りを読まずに置く。4 MiB はクライアントが広告したウィンドウ
+    // (initial_max_data = 256 KiB) より大きいため、読み続けない限りサーバーの
+    // 送信はフロー制御で止まる。
+    let mut first = [0u8; 1];
+    let read = tokio::time::timeout(GUARD, recv.read(&mut first))
+        .await
+        .expect("guard の時間内に最初の 1 バイトが届く")
+        .expect("読み取りに失敗しない");
+    assert_eq!(read, Some(1), "最初の 1 バイトを読み取れること");
     assert!(
         !writer.is_finished(),
-        "読まない間はフロー制御でサーバーの送信が止まること"
+        "読み続けない間はフロー制御でサーバーの送信が止まること"
     );
 
     // 以後は読み続けるだけにする。追加のコマンドは送らない
-    let data = read_to_end(&mut recv).await;
+    let mut data = first.to_vec();
+    data.extend(read_to_end(&mut recv).await);
     assert_eq!(
         data.len(),
         TOTAL,
@@ -523,10 +625,30 @@ async fn deferred_delivery_is_bounded_by_flow_control() {
     });
 
     // クライアントは読まない。ウィンドウとチャネルの容量を超えた分は
-    // フロー制御で止まる
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let pushed_first = pushed.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // フロー制御で止まる。固定時間の sleep で「止まった」と決めつけないよう、
+    // 受け付けた量が変化しなくなるまで観測する。
+    let mut last = pushed.load(Ordering::SeqCst);
+    let mut stable = 0;
+    for _ in 0..(GUARD.as_millis() / 50) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let current = pushed.load(Ordering::SeqCst);
+        if current == last && current > 0 {
+            stable += 1;
+            if stable >= 4 {
+                break;
+            }
+        } else {
+            stable = 0;
+            last = current;
+        }
+    }
+    let pushed_first = last;
+    assert!(
+        pushed_first > 0,
+        "クライアントが読まない間もサーバーの送信は進むこと"
+    );
+    // 止まったとみなした後も、余裕をもった時間だけ増えないことを確認する
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let pushed_second = pushed.load(Ordering::SeqCst);
 
     assert_eq!(
@@ -633,9 +755,12 @@ async fn idle_timeout_resolves_while_write_is_blocked() {
         .await
         .expect("guard の時間内に開ける")
         .expect("ストリームを開ける");
-    let writer = tokio::spawn(async move { send.write(&vec![0x5au8; 32 * 1024]).await });
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let writer = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        send.write(&vec![0x5au8; 32 * 1024]).await
+    });
+    started_rx.await.expect("書き込みが開始される");
     assert!(
         !writer.is_finished(),
         "ピアが読み取らないため書き込みは完了しないこと"
@@ -674,8 +799,12 @@ async fn transport_end_is_observed_while_write_is_blocked() {
 
     // 受信側が読まないため、フロー制御で書き込みが詰まる。受信側のチャネルが
     // 埋まるまでは受け付けられるため、それを十分に超える量を書く
-    let writer = tokio::spawn(async move { send.write(&vec![0x5au8; 4 * 1024 * 1024]).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let writer = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        send.write(&vec![0x5au8; 4 * 1024 * 1024]).await
+    });
+    started_rx.await.expect("書き込みが開始される");
     assert!(
         !writer.is_finished(),
         "受信側が読まないため書き込みは完了しないこと"
@@ -719,10 +848,9 @@ async fn accept_progresses_when_accept_channel_is_full() {
         server_streams.push((send, recv));
     }
 
-    // ドライバがストリームを登録し終えて待機状態に入るまで待つ
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // アプリケーションは accept だけを行う。ハンドルはドロップせずに保持する
+    // accept はドライバがストリームを登録するまで待つため、固定時間の sleep は
+    // 置かない。アプリケーションが accept すること自体がドライバの起床要因に
+    // なることを確認する。受け取ったハンドルはドロップせずに保持する。
     let mut client_streams = Vec::new();
     for _ in 0..STREAMS {
         let accepted = tokio::time::timeout(GUARD, client.accept_bidirectional())
@@ -783,10 +911,9 @@ async fn stop_sending_progresses_when_channel_is_full() {
         recv.stop_sending(9).await.expect("STOP_SENDING を送れる");
     }
 
-    // ドライバが通知を登録し終えて待機状態に入るまで待つ
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // アプリケーションは通知を受け取るだけを行う
+    // recv_stop_sending はドライバが通知を登録するまで待つため、固定時間の
+    // sleep は置かない。アプリケーションが通知を受け取ること自体がドライバの
+    // 起床要因になることを確認する。
     let mut observed = Vec::new();
     for _ in 0..STREAMS {
         let notification = tokio::time::timeout(GUARD, client.recv_stop_sending())
@@ -902,11 +1029,13 @@ async fn idle_timeout_shuts_down_write_side_before_driver_ends() {
         "送信側の shutdown がドライバの終了より前にピアへ届くこと: \
          EOF {eof_elapsed:?} / ドライバ終了 {driver_elapsed:?}"
     );
-    // linger の期限まで待たずに shutdown が届くこと。shutdown を送らない実装では、
-    // ピアが EOF を観測するのはドライバが linger の期限で終了する時点になる。
+    // linger の期限 (SHUTDOWN_LINGER) まで待たずに shutdown が届くこと。
+    // shutdown を送らない実装ではドライバが期限の満了まで終了しないため、
+    // 上の GUARD の待ち合わせがタイムアウトする。ここでは期限より前に
+    // 終了したことを明示的に確認する。
     assert!(
-        eof_elapsed < Duration::from_secs(1),
-        "shutdown が linger ({SHUTDOWN_LINGER:?}) の期限を待たずに届くこと: EOF {eof_elapsed:?}"
+        driver_elapsed < SHUTDOWN_LINGER,
+        "shutdown が linger ({SHUTDOWN_LINGER:?}) の期限を待たずに届くこと: ドライバ終了 {driver_elapsed:?}"
     );
 }
 
@@ -941,8 +1070,8 @@ async fn peer_close_shuts_down_write_side_before_driver_ends() {
     );
     // linger の期限まで待たずに shutdown が届くこと (アイドルタイムアウトの場合と同じ)
     assert!(
-        eof_elapsed < Duration::from_secs(1),
-        "shutdown が linger ({SHUTDOWN_LINGER:?}) の期限を待たずに届くこと: EOF {eof_elapsed:?}"
+        driver_elapsed < SHUTDOWN_LINGER,
+        "shutdown が linger ({SHUTDOWN_LINGER:?}) の期限を待たずに届くこと: ドライバ終了 {driver_elapsed:?}"
     );
 }
 
@@ -1020,19 +1149,20 @@ async fn multiple_datagrams_and_empty_datagram_are_received_in_order() {
             .expect("DATAGRAM を送れる");
     }
 
-    // ドライバが受信イベントをチャネルへ移し終えるまで待つ。DATAGRAM は
-    // フロー制御されないため、受信側のドライバとアプリケーションの進み方は
-    // 非同期である。
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 到着済みの DATAGRAM をまとめて取り出せること
-    let batch = tokio::time::timeout(GUARD, server.recv_datagrams())
-        .await
-        .expect("guard の時間内に DATAGRAM が届く")
-        .expect("受信に失敗しない")
-        .expect("DATAGRAM が届く");
+    // 3 つすべてが届くまでまとめて受け取る。固定時間の sleep で到着を仮定せず、
+    // recv_datagrams が返した分を積み上げて順序を検証する (1 回の呼び出しに
+    // まとまるかどうかは到着のタイミングに依存する)。
+    let mut received = Vec::new();
+    while received.len() < payloads.len() {
+        let batch = tokio::time::timeout(GUARD, server.recv_datagrams())
+            .await
+            .expect("guard の時間内に DATAGRAM が届く")
+            .expect("受信に失敗しない")
+            .expect("DATAGRAM が届く");
+        received.extend(batch);
+    }
     assert_eq!(
-        batch,
+        received,
         payloads
             .iter()
             .map(|payload| payload.to_vec())
@@ -1181,4 +1311,91 @@ async fn send_datagram_fails_when_datagram_exceeds_record_capacity() {
 
     close_and_wait(&client, 0, "done").await;
     close_and_wait(&server, 0, "done").await;
+}
+
+#[tokio::test]
+async fn send_datagram_fails_when_send_queue_is_full() {
+    // 送信待ちの DATAGRAM には上限がある。ピアが読み取らずに送信が詰まって
+    // いる状態で上限を超える数の送信を並行に要求すると、あふれた分は
+    // Error::DatagramQueueFull で失敗し、接続は閉じないこと。
+    const REQUESTS: usize = 200;
+
+    let (client_io, peer_io) = tokio::io::duplex(4096);
+    let client = Arc::new(
+        Connection::with_linger(Role::Client, client_io, datagram_config(), TEST_LINGER)
+            .expect("クライアントを作成できる"),
+    );
+
+    // ピアはハンドシェイクだけ手動で済ませ、以後は読み取らない
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut io = peer_io;
+        let mut peer = DwnxConnection::server(&datagram_config()).expect("ピアを作成できる");
+        let mut buf = [0u8; 4096];
+        let mut out = Vec::new();
+        let mut ready_tx = Some(ready_tx);
+        loop {
+            match io.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(len) => {
+                    if peer.read(&buf[..len], 0).is_err() {
+                        return;
+                    }
+                    loop {
+                        out.clear();
+                        match peer.poll_transmit(&mut out, 0) {
+                            Ok(true) => {
+                                if io.write_all(&out).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(false) => break,
+                            Err(_) => return,
+                        }
+                    }
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                        // ここから先は読み取らない。クライアントの送信を詰まらせる
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                }
+            }
+        }
+    });
+    ready_rx.await.expect("ピアがハンドシェイクを終える");
+
+    // 送信を並行に要求する。ピアが読み取らないため、上限を超えた分は
+    // 送信待ちに積まれずに即座に失敗する
+    let payload = vec![0x5au8; 1024];
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..REQUESTS {
+        let client = Arc::clone(&client);
+        let payload = payload.clone();
+        requests.spawn(async move { client.send_datagram(&payload).await });
+    }
+
+    // キューに積めなかった送信のエラーが返るまで待つ。詰まっている送信は
+    // 完了しないため、エラーを 1 つ観測した時点で打ち切る。
+    let mut queue_full = false;
+    while let Some(result) = tokio::time::timeout(GUARD, requests.join_next())
+        .await
+        .expect("guard の時間内にいずれかの送信が結果を返す")
+    {
+        match result.expect("送信タスクがパニックしない") {
+            Ok(()) => {}
+            Err(tokio_dwnx::Error::DatagramQueueFull) => {
+                queue_full = true;
+                break;
+            }
+            Err(error) => panic!("想定しないエラー: {error}"),
+        }
+    }
+    assert!(
+        queue_full,
+        "送信待ちの上限を超えると Error::DatagramQueueFull になること"
+    );
+    assert!(!client.is_closed(), "キュー満杯は接続の終了ではないこと");
+
+    requests.abort_all();
+    peer.abort();
 }

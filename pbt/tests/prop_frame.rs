@@ -6,6 +6,7 @@
 //! のラウンドトリップ、decode の消費バイト数を検証する。
 
 use pbt::common::sample_bytes;
+use pbt::common::sample_option;
 use pbt::common::sample_varint;
 use pbt::common::test_runner;
 use shiguredo_qmux::codec::frame::Frame;
@@ -161,14 +162,11 @@ fn sample_qmux_frame_of_kind(ctx: &mut noprop::TestCaseContext, kind: usize) -> 
         })),
         13 => {
             // RFC 9000 Section 19.19: 0x1c (トランスポートエラー) はエラーを引き起こした
-            // フレームタイプを持ち、0x1d (アプリケーションエラー) は持たない。
-            // encode と decode が一致する組み合わせだけを生成する。
+            // フレームタイプを必ず持つ。不明な場合は 0 を送る。0x1d (アプリケーション
+            // エラー) はフレームタイプを持たない。フィールドの有無は application だけで
+            // 決まるため、frame_type は None と Some の両方を独立に生成してよい。
             let application = noprop::sample_bool(ctx);
-            let frame_type = if application {
-                None
-            } else {
-                Some(sample_varint(ctx))
-            };
+            let frame_type = sample_option(ctx, sample_varint);
             QmuxFrame::Quic(Frame::ConnectionClose(ConnectionClose {
                 application,
                 error_code: sample_varint(ctx),
@@ -203,23 +201,61 @@ fn frame_kind(frame: &QmuxFrame) -> usize {
     }
 }
 
+/// encode → decode した後に観測されるフレームを返す
+///
+/// CONNECTION_CLOSE は Frame Type フィールドの有無が application だけで決まるため、
+/// 生成時の `frame_type` がそのまま戻るとは限らない。
+///
+/// - 0x1c (トランスポートエラー): フィールドは必須で、`None` は未知を表す 0 として
+///   出力され、`Some(0)` としてデコードされる (RFC 9000 Section 19.19)
+/// - 0x1d (アプリケーションエラー): フィールドは出力されないため常に `None` になる
+fn expected_after_roundtrip(frame: &QmuxFrame) -> QmuxFrame {
+    match frame {
+        QmuxFrame::Quic(Frame::ConnectionClose(close)) => {
+            QmuxFrame::Quic(Frame::ConnectionClose(ConnectionClose {
+                application: close.application,
+                error_code: close.error_code,
+                frame_type: if close.application {
+                    None
+                } else {
+                    Some(close.frame_type.unwrap_or(0))
+                },
+                reason_phrase: close.reason_phrase.clone(),
+            }))
+        }
+        other => other.clone(),
+    }
+}
+
 /// 生成した QmuxFrame が encode → decode で元に戻る
 ///
 /// 生成対象の全種別が 1 度は現れることをカバレッジゲートで確認する。
 #[test]
 fn roundtrip() -> noprop::TestResult {
     let seen = std::cell::Cell::new(0u32);
+    // 0x1c で Frame Type が不明 (None) のケースを必ず生成する
+    let unknown_frame_type_seen = std::cell::Cell::new(false);
     let mut runner = test_runner()?;
     runner.run(512, |ctx| {
         let frame = sample_qmux_frame(ctx);
         let mut buf = Vec::new();
         frame.encode(&mut buf);
         let (decoded, size) = decode(&buf).expect("エンコード直後のバイト列なのでデコードできる");
-        assert_eq!(decoded, frame, "ラウンドトリップ結果が一致しない");
+        assert_eq!(
+            decoded,
+            expected_after_roundtrip(&frame),
+            "ラウンドトリップ結果が一致しない"
+        );
         assert_eq!(size, buf.len(), "消費バイト数がエンコード長と一致しない");
 
         // assert 通過後に種別を記録する
         seen.set(seen.get() | (1u32 << frame_kind(&frame)));
+        if let QmuxFrame::Quic(Frame::ConnectionClose(close)) = &frame
+            && !close.application
+            && close.frame_type.is_none()
+        {
+            unknown_frame_type_seen.set(true);
+        }
         Ok(())
     })?;
 
@@ -229,6 +265,10 @@ fn roundtrip() -> noprop::TestResult {
         expected,
         "全種別のフレームが生成されなかった: seen={:#x} expected={expected:#x}\n{runner}",
         seen.get()
+    );
+    assert!(
+        unknown_frame_type_seen.get(),
+        "0x1c で Frame Type が不明 (None) のケースが生成されなかった\n{runner}"
     );
     Ok(())
 }
@@ -256,7 +296,8 @@ fn decode_record_roundtrip() -> noprop::TestResult {
             frame.encode(&mut buf);
         }
         let decoded = decode_record(&buf).expect("エンコード直後のバイト列なのでデコードできる");
-        assert_eq!(decoded, frames, "Record 内のフレーム列が一致しない");
+        let expected: Vec<QmuxFrame> = frames.iter().map(expected_after_roundtrip).collect();
+        assert_eq!(decoded, expected, "Record 内のフレーム列が一致しない");
         Ok(())
     })?;
     Ok(())

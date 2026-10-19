@@ -81,6 +81,46 @@ fn encode_omits_default_values() {
 }
 
 #[test]
+fn iana_registered_parameter_id_values_match_specification() {
+    // draft-ietf-quic-qmux-02 Section 13.2 と RFC 9221 Section 3 の IANA 登録値を
+    // 数値リテラルで固定する。定数の数値が誤っていても、定数シンボル同士の比較では
+    // 検出できないため、相互接続を壊す変更をここで検出する。
+    assert_eq!(
+        MAX_RECORD_SIZE_ID, 0x0571c59429cd0845,
+        "max_record_size の登録値が一致すること (Section 13.2)"
+    );
+    assert_eq!(
+        param_id::MAX_DATAGRAM_FRAME_SIZE,
+        0x20,
+        "max_datagram_frame_size の登録値が一致すること (RFC 9221 Section 3)"
+    );
+}
+
+#[test]
+fn max_record_size_at_default_is_accepted() {
+    // Section 5.2: 明示的に送られた max_record_size は既定値以上なら有効であり、
+    // 既定値ちょうども受理しなければならない。境界を固定するため、生バイト列で
+    // 組み立てる。
+    //
+    // ID 0x0571c59429cd0845 の 8 バイト形 (c5 71 c5 94 29 cd 08 45)、
+    // 値の長さ 2、値 16382 (既定値) の 2 バイト形 (7f fe)。
+    let buf = [
+        0xc5, 0x71, 0xc5, 0x94, 0x29, 0xcd, 0x08, 0x45, 0x02, 0x7f, 0xfe,
+    ];
+    let params =
+        TransportParameters::decode(&buf).expect("既定値ちょうどの max_record_size は有効");
+    assert_eq!(
+        params.max_record_size, DEFAULT_MAX_RECORD_SIZE,
+        "既定値ちょうどの値がそのまま反映されること"
+    );
+    assert_eq!(
+        params,
+        TransportParameters::default(),
+        "他のパラメータが省略された既定値のままであること"
+    );
+}
+
+#[test]
 fn max_record_size_below_default_is_rejected() {
     // Section 5.2: 既定値未満の値は TRANSPORT_PARAMETER_ERROR
     let buf = varint_param(MAX_RECORD_SIZE_ID, DEFAULT_MAX_RECORD_SIZE - 1);

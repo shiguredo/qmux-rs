@@ -57,6 +57,9 @@ fn main() {
     // HAVE_DECL_BE64TOH / HAVE_DECL_BSWAP_64 は未定義のままにして、
     // ntohl を使う可搬なフォールバックを選ぶ。
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // Windows は未対応であり、この分岐は CI でビルドしていない (未検証)。
+    // Windows には <arpa/inet.h> などが無いため、ヘッダ有無マクロを定義しない。
+    // Windows へ対応する場合は、必要なヘッダと ntohl などの代替実装を確認すること。
     if target_os != "windows" {
         build.define("HAVE_ARPA_INET_H", None);
         build.define("HAVE_NETINET_IN_H", None);

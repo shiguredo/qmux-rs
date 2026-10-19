@@ -18,12 +18,27 @@ pub const MAX_CONFIG_STREAMS: u64 = 1 << 16;
 
 /// QMux 接続の設定
 ///
-/// 値はそのまま QX_TRANSPORT_PARAMETERS フレームとしてピアへ送られる。既定値は
-/// RFC 9000 と draft-ietf-quic-qmux-02 の既定値と同じで、フロー制御のクレジットは
-/// 0 である。ストリームや DATAGRAM を使う場合は明示的に設定すること。
+/// 値は [`Config::transport_parameters`] で [`TransportParameters`] へ変換され、
+/// QX_TRANSPORT_PARAMETERS フレームとしてピアへ送られる。変換の際には次の規則が
+/// 適用されるため、設定した値がそのまま観測されるとは限らない。
+///
+/// - QUIC version 1 の既定値と同じ 0 の値は、トランスポートパラメータの
+///   エンコードで省略される (RFC 9000 Section 18.2)
+/// - [`Config::max_idle_timeout`] は [`crate::codec::time::Duration`] から
+///   ミリ秒単位の整数へ変換される
+/// - [`Config::max_record_size`] は既定値 ([`crate::record::DEFAULT_MAX_RECORD_SIZE`])
+///   と同じ場合に省略される
+/// - [`Config::max_datagram_frame_size`] は `None` なら省略され、`Some(0)` なら
+///   値 0 のパラメータとして送られる
+///
+/// 既定値は RFC 9000 と draft-ietf-quic-qmux-02 の既定値と同じで、フロー制御の
+/// クレジットは 0 である。ストリームや DATAGRAM を使う場合は明示的に設定すること。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// アイドルタイムアウト (Section 7.1)。`Duration::ZERO` は無効
+    ///
+    /// トランスポートパラメータへはミリ秒単位の整数に変換して送る。ミリ秒未満の
+    /// 端数は切り捨てる ([`crate::codec::time::Duration::as_millis`])。
     pub max_idle_timeout: Duration,
     /// 接続レベルで受信できるデータ量の初期値 (RFC 9000 Section 18.2)
     pub initial_max_data: u64,
@@ -43,14 +58,17 @@ pub struct Config {
     pub initial_max_streams_uni: u64,
     /// ピアが送信できる QMux Record の Size の上限 (Section 5.2)
     ///
-    /// `DEFAULT_MAX_RECORD_SIZE` (16382) 以上でなければならない。既定値未満の値を
-    /// 設定した場合、[`crate::connection::Connection::new`] が
-    /// [`crate::codec::error::Error::InvalidData`] を返す。
+    /// [`crate::record::DEFAULT_MAX_RECORD_SIZE`] (16382) 以上でなければならない。
+    /// 既定値未満の値を設定した場合、[`crate::connection::Connection::new`] が
+    /// [`crate::codec::error::Error::InvalidData`] を返す。既定値と同じ場合は
+    /// トランスポートパラメータのエンコードで省略される。
     pub max_record_size: u64,
     /// 受信を許可する DATAGRAM フレームの最大サイズ (RFC 9221 Section 3)
     ///
     /// `None` と `Some(0)` はどちらも DATAGRAM 拡張を使わないことを表す
-    /// (RFC 9221 では 0 が非サポートを意味する)。
+    /// (RFC 9221 では 0 が非サポートを意味する)。エンコードでは `None` は
+    /// パラメータ自体を省略し、`Some(0)` は非サポートを明示する値 0 の
+    /// パラメータとして送るため、両者はピアから区別できる。
     pub max_datagram_frame_size: Option<u64>,
 }
 
@@ -74,6 +92,8 @@ impl Config {
     /// 設定をローカルのトランスポートパラメータへ変換する
     ///
     /// アイドルタイムアウトはミリ秒単位のトランスポートパラメータへ変換する。
+    /// 0 の値と既定値の `max_record_size`、`None` の `max_datagram_frame_size` は
+    /// エンコードで省略される ([`TransportParameters::encode`])。
     pub fn transport_parameters(&self) -> TransportParameters {
         TransportParameters {
             max_idle_timeout: self.max_idle_timeout.as_millis(),

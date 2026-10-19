@@ -7,7 +7,8 @@
 //! DATAGRAM を使うには、双方のトランスポートパラメータで
 //! `max_datagram_frame_size` を 0 より大きくする (RFC 9221 Section 3)。
 //! 受信した DATAGRAM は保持量の上限を超えると破棄され、破棄した個数は
-//! [`Connection::dropped_datagrams`] で観測できる。
+//! [`Connection::dropped_datagrams`] で観測できる。送信待ちの DATAGRAM にも
+//! 上限があり、あふれた送信は [`Error::DatagramQueueFull`] になる。
 
 #![forbid(unsafe_code)]
 

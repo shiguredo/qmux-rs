@@ -13,42 +13,81 @@ use crate::codec::varint::VarInt;
 /// フレームタイプ定数 (RFC 9000 Section 12.4、RFC 9221 Section 4)
 ///
 /// QMux で利用が禁止されたフレームと、利用が許可されていない拡張フレームの
-/// タイプも、判定のためにここで定義する。
+/// タイプも、判定のためにここで定義する。各フレームの形式と意味は RFC 9000
+/// Section 19 および RFC 9221 Section 4 を参照すること。
 pub mod frame_type {
     // RFC 9000 標準フレーム
+    /// PADDING フレーム (RFC 9000 Section 19.1)
     pub const PADDING: u64 = 0x00;
+    /// PING フレーム (RFC 9000 Section 19.2)
     pub const PING: u64 = 0x01;
+    /// ACK フレーム (RFC 9000 Section 19.3)
     pub const ACK: u64 = 0x02;
+    /// ECN 付き ACK フレーム (RFC 9000 Section 19.3)
     pub const ACK_ECN: u64 = 0x03;
+    /// RESET_STREAM フレーム (RFC 9000 Section 19.4)
     pub const RESET_STREAM: u64 = 0x04;
+    /// STOP_SENDING フレーム (RFC 9000 Section 19.5)
     pub const STOP_SENDING: u64 = 0x05;
+    /// CRYPTO フレーム (RFC 9000 Section 19.6)
     pub const CRYPTO: u64 = 0x06;
+    /// NEW_TOKEN フレーム (RFC 9000 Section 19.7)
     pub const NEW_TOKEN: u64 = 0x07;
+    /// STREAM フレームのタイプ範囲の最小値 (0x08、RFC 9000 Section 19.8)
+    ///
+    /// STREAM フレームのタイプは 0x08 から 0x0f までの 8 種類で、OFF ビットと
+    /// LEN ビットと FIN ビットの組み合わせを表す。
     pub const STREAM_START: u64 = 0x08;
+    /// STREAM フレームのタイプ範囲の最大値 (0x0f、RFC 9000 Section 19.8)
     pub const STREAM_END: u64 = 0x0f;
+    /// MAX_DATA フレーム (RFC 9000 Section 19.9)
     pub const MAX_DATA: u64 = 0x10;
+    /// MAX_STREAM_DATA フレーム (RFC 9000 Section 19.10)
     pub const MAX_STREAM_DATA: u64 = 0x11;
+    /// 双方向ストリーム数の上限を通知する MAX_STREAMS フレーム (RFC 9000 Section 19.11)
     pub const MAX_STREAMS_BIDI: u64 = 0x12;
+    /// 単方向ストリーム数の上限を通知する MAX_STREAMS フレーム (RFC 9000 Section 19.11)
     pub const MAX_STREAMS_UNI: u64 = 0x13;
+    /// DATA_BLOCKED フレーム (RFC 9000 Section 19.12)
     pub const DATA_BLOCKED: u64 = 0x14;
+    /// STREAM_DATA_BLOCKED フレーム (RFC 9000 Section 19.13)
     pub const STREAM_DATA_BLOCKED: u64 = 0x15;
+    /// 双方向ストリーム数の上限でブロックしていることを通知する STREAMS_BLOCKED フレーム
+    /// (RFC 9000 Section 19.14)
     pub const STREAMS_BLOCKED_BIDI: u64 = 0x16;
+    /// 単方向ストリーム数の上限でブロックしていることを通知する STREAMS_BLOCKED フレーム
+    /// (RFC 9000 Section 19.14)
     pub const STREAMS_BLOCKED_UNI: u64 = 0x17;
+    /// NEW_CONNECTION_ID フレーム (RFC 9000 Section 19.15)
     pub const NEW_CONNECTION_ID: u64 = 0x18;
+    /// RETIRE_CONNECTION_ID フレーム (RFC 9000 Section 19.16)
     pub const RETIRE_CONNECTION_ID: u64 = 0x19;
+    /// PATH_CHALLENGE フレーム (RFC 9000 Section 19.17)
     pub const PATH_CHALLENGE: u64 = 0x1a;
+    /// PATH_RESPONSE フレーム (RFC 9000 Section 19.18)
     pub const PATH_RESPONSE: u64 = 0x1b;
+    /// トランスポートエラーによる接続閉鎖を通知する CONNECTION_CLOSE フレーム
+    /// (RFC 9000 Section 19.19)
     pub const CONNECTION_CLOSE: u64 = 0x1c;
+    /// アプリケーションエラーによる接続閉鎖を通知する CONNECTION_CLOSE フレーム
+    /// (RFC 9000 Section 19.19)
     pub const APPLICATION_CLOSE: u64 = 0x1d;
+    /// HANDSHAKE_DONE フレーム (RFC 9000 Section 19.20)
     pub const HANDSHAKE_DONE: u64 = 0x1e;
 
     // DATAGRAM 拡張 (RFC 9221 Section 4)
+    /// 長さフィールドを持たない DATAGRAM フレーム (RFC 9221 Section 4)
     pub const DATAGRAM: u64 = 0x30;
+    /// 長さフィールドを持つ DATAGRAM フレーム (RFC 9221 Section 4)
     pub const DATAGRAM_LEN: u64 = 0x31;
 
     // Reliable Stream Reset 拡張 (draft-ietf-quic-reliable-stream-reset-11 Section 4)
     // QMux は本拡張をネゴシエートしないため、受信しても未知のフレームとして拒否する。
     // 値は暫定値であり、RFC 化時に変更される可能性がある。
+    /// RESET_STREAM_AT フレーム (draft-ietf-quic-reliable-stream-reset-11 Section 4)
+    ///
+    /// QMux は本拡張をネゴシエートしないため、受信しても未知のフレームタイプとして
+    /// FRAME_ENCODING_ERROR で拒否する。
     pub const RESET_STREAM_AT: u64 = 0x24;
 }
 
