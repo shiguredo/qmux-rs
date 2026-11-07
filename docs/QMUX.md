@@ -74,6 +74,16 @@ graceful に shutdown して終了します。このとき `shiguredo_tokio_qmux
 を破棄します。下位トランスポートへの書き込みが途中の Record は境界を壊さないため
 完遂します。
 
+`shiguredo_tokio_qmux::Connection::close` は要求を送るだけで、送信完了も終了も待ちません。
+CONNECTION_CLOSE の送信完了を待ってから接続をドロップする場合は
+`shiguredo_tokio_qmux::Connection::close_and_wait` を使います。これは CONNECTION_CLOSE を
+含む Record を書き出し、下位トランスポートの送信側の shutdown を試みた時点で返ります。
+ピアの shutdown とドライバの終了は待たないため、`closed` より早く返ります。
+送信バッファが詰まっている場合は、shutdown の完了を linger の上限まで待つことがあります。
+返った後に接続をドロップすると、ドライバは linger を待たずに終了します。待つのは
+下位トランスポートへの書き出しと shutdown の完了であり、ピアが CONNECTION_CLOSE を
+処理したことまでは保証しません。
+
 `shiguredo_tokio_qmux::Connection` をドロップした場合も、ドライバは linger の期限を待たずに
 下位トランスポートを閉じて終了します。この上限は close の後にピアの shutdown を
 待つ間の打ち切りであり、ドロップによる終了を遅らせるものではありません。
@@ -81,10 +91,14 @@ graceful に shutdown して終了します。このとき `shiguredo_tokio_qmux
 ## tokio ラッパーのストリーム
 
 `shiguredo_tokio_qmux::RecvStream` をドロップすると、アプリケーションがもうデータを受け取らない
-ものとして、ドライバはピアへ STOP_SENDING を送ります (RFC 9000 Section 3.5)。
-アプリケーションが受け取らないデータをピアに送り続けさせないためです。ただし、
-FIN または RESET_STREAM を配送済みのストリームと、ドライバのコマンドチャネルが満杯の
-場合は STOP_SENDING を送らないことがあります。
+ものとして、ドライバはピアへコード 0 (NO_ERROR) の STOP_SENDING を送ります
+(RFC 9000 Section 3.5)。アプリケーションが受け取らないデータをピアに送り続けさせない
+ためです。ただし、FIN または RESET_STREAM を配送済みのストリームと、ドライバの
+コマンドチャネルが満杯の場合は STOP_SENDING を送らないことがあります。
+
+明示的に `shiguredo_tokio_qmux::RecvStream::stop_sending` を送信済みのストリームでは、
+2 回目以降の要求をコアが無視します。ドロップしてもコード 0 の STOP_SENDING は重ねて
+送られず、最初に指定したアプリケーションエラーコードが維持されます。
 
 `shiguredo_tokio_qmux::SendStream` の `write` は、FIN または RESET_STREAM を送った後に
 `shiguredo_tokio_qmux::Error::StreamFinished` を返します。ピアの STOP_SENDING で送信側が終端した
@@ -95,8 +109,9 @@ FIN または RESET_STREAM を配送済みのストリームと、ドライバ�
 ストリーム上限に達している場合、ピアが MAX_STREAMS を送るまで待ちます。待機中に
 接続が閉じた場合は `shiguredo_tokio_qmux::Error::ConnectionClosed` を返します。
 
-`shiguredo_tokio_qmux::Connection::close` は `Result<()>` を返し、アプリケーションエラーコードが
-可変長整数の上限 (2^62-1) を超える場合は `shiguredo_tokio_qmux::Error::Qmux` を返します。
+`shiguredo_tokio_qmux::Connection::close` / `close_and_wait` は `Result<()>` を返し、
+アプリケーションエラーコードが可変長整数の上限 (2^62-1) を超える場合は
+`shiguredo_tokio_qmux::Error::Qmux` を返します。
 
 ## 仕様との対応
 
@@ -111,7 +126,7 @@ FIN または RESET_STREAM を配送済みのストリームと、ドライバ�
 | Section 5.2 max_record_size | `record.rs` / `transport_params.rs`。既定値 16382、既定値未満は TRANSPORT_PARAMETER_ERROR |
 | Section 6 Forward Progress | `receive` はアプリケーションの読み取りと独立に Record を処理する |
 | Section 7.1 アイドルタイムアウト | `connection.rs`。実効値は両端の 0 でない値の最小値。ブロック中で実効アイドルタイムアウトが有効な場合は `DATA_BLOCKED` / `STREAM_DATA_BLOCKED` を 1 秒間隔で再送する (`next_timeout` / `handle_timeout`) |
-| Section 7.2 / 7.3 切断 | `connection.rs` / `crates/tokio-qmux`。CONNECTION_CLOSE の送受信、切断後のデータ破棄、EOF の `CloseReason::PeerShutdown` 通知、tokio 側の linger 待ち (「tokio ラッパーの切断」参照) |
+| Section 7.2 / 7.3 切断 | `connection.rs` / `crates/tokio-qmux`。CONNECTION_CLOSE の送受信、切断後のデータ破棄、EOF の `CloseReason::PeerShutdown` 通知、tokio 側の linger 待ちと `close_and_wait` (「tokio ラッパーの切断」参照) |
 | Section 8.1 ALPN | 下位トランスポートの責務であり、`shiguredo_qmux` は関与しない。`shiguredo_tokio_qmux` の doc に利用者が負う MUST (未ネゴシエート時のハンドシェイク中止、QUIC マッピングと異なる識別子) を記載し、interop が ALPN 不一致の負の経路を検証する |
 | Section 8.2 0-RTT | 未実装。remembered transport parameters を扱わない (詳細は「未実装」節) |
 | Section 9.1 DATAGRAM 拡張 | `connection.rs`。送信は `max_datagram_frame_size` と `max_record_size` の両方で上限を検査し、受信は広告した上限の超過と非サポート時の受信を PROTOCOL_VIOLATION とする |
@@ -131,7 +146,16 @@ Section 9.1 が例示する 16381 バイトは Length フィールドを省略�
 `max_record_size` が既定値 (16382) のときは Record 側が上限になり、ピアが
 `max_datagram_frame_size` をそれより大きく広告しても、ペイロードが 16379 バイトを
 超える DATAGRAM は送れません。ピアが `max_datagram_frame_size` を 16382 より小さく
-広告した場合は、`max_datagram_frame_size` 側が上限になります。
+広告した場合は、`max_datagram_frame_size` 側が上限になります。ピアが
+`max_record_size` を既定値より大きく広告した場合は、16379 バイトは上限ではなくなり、
+`max_datagram_frame_size` と Record の両方に収まる範囲まで送れます。
+
+QMux の DATAGRAM は、下位トランスポートが順序保証された信頼的なバイトストリームで
+あるため、QUIC の DATAGRAM が提供する非信頼・順不同配送を提供しません。ただし、
+アプリケーションが速やかに受け取れない場合は破棄されることがあります (Section 6)。
+非信頼・順不同のデータグラムを前提とするプロトコル (MOQT の OBJECT_DATAGRAM など) を
+QMux 上で動かす場合、データグラムの意味は QUIC 経路と異なります。QMux の DATAGRAM を
+使うかどうかは、この違いを受け入れられるかで判断してください。
 
 RFC 9000 側の規則は QMux の順序保証に合わせて適用します。
 
@@ -212,9 +236,12 @@ Sans I/O のため、`Connection::poll_transmit` が Record をバッファへ�
 接続エラーとして扱う前提です。送信側のローカルなエンコード失敗は
 `Error::InvalidData` です。
 
-`Connection::close` / `reset` / `stop_sending` のアプリケーションエラーコードは
-可変長整数の上限 (2^62-1) 以下でなければなりません。超える値は `Error::InvalidData`
-として返され、panic しません。`Connection::close` は `Result<(), Error>` を返します。
+`Connection::close` / `close_and_wait` / `reset` / `stop_sending` のアプリケーション
+エラーコードは可変長整数の上限 (2^62-1) 以下でなければなりません。超える値は
+`Error::InvalidData` として返され、panic しません。`Connection::close` と
+`Connection::close_and_wait` は `Result<(), Error>` を返します。`close_and_wait` は、
+接続が既に閉じている場合、閉じる途中の場合、close を送れずにドライバが終了した
+場合に `Error::ConnectionClosed` を返します。
 
 ## 仕様の記載に関する注意
 
