@@ -12,7 +12,7 @@ use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::codec::time::Duration;
 use shiguredo_qmux::codec::time::Timestamp;
 use shiguredo_qmux::config::Config;
-use shiguredo_qmux::event::CloseReason;
+use shiguredo_qmux::event::{CloseReason, Event};
 use shiguredo_qmux::frame::QmuxFrame;
 use shiguredo_qmux::record;
 use shiguredo_tokio_qmux::{Connection, Error, RecvStream};
@@ -624,6 +624,38 @@ async fn handshake_sans_io_peer(
     }
 }
 
+/// ピアが CONNECTION_CLOSE を観測するまで読み取り、切断理由を返す
+///
+/// close を送った側が送信側を shutdown した後も、ピアは Record を読み切れば
+/// CONNECTION_CLOSE を観測できる。読み取りが EOF になった場合は close が届く前に
+/// トランスポートが閉じたことを意味するため、テストを失敗させる。
+async fn read_until_close(
+    peer_io: &mut tokio::io::DuplexStream,
+    peer: &mut shiguredo_qmux::connection::Connection,
+) -> CloseReason {
+    let now = Timestamp::from_micros(0);
+    let mut scratch = [0u8; 1024];
+    loop {
+        let len = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_io.read(&mut scratch),
+        )
+        .await
+        .expect("ピアが close を読み取れること")
+        .expect("ピアの読み取りが失敗しないこと");
+        assert!(
+            len > 0,
+            "CONNECTION_CLOSE より先に下位トランスポートの EOF を観測しないこと"
+        );
+        peer.receive(&scratch[..len], now);
+        while let Some(event) = peer.poll_event() {
+            if let Event::ConnectionClosed(reason) = event {
+                return reason;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn close_ends_driver_when_peer_never_shuts_down() {
     // Section 7.2: 自側から close した場合、ドライバは CONNECTION_CLOSE を送った後で
@@ -671,6 +703,228 @@ async fn close_ends_driver_when_peer_never_shuts_down() {
         .await
         .expect("ピアが EOF を観測して終了すること")
         .expect("ピアのタスクが終了すること");
+}
+
+#[tokio::test]
+async fn close_and_wait_returns_before_peer_shutdown() {
+    // Section 7.2: close の送信完了は、ピアの shutdown やドライバの終了を待たない。
+    // linger を 30 秒にしても、CONNECTION_CLOSE の書き出しと送信側の shutdown が
+    // 済んだ時点で close_and_wait が返ることを検証する。
+    let (peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::with_linger(
+        Role::Client,
+        client_io,
+        config(),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("テスト用のクライアント接続を作成できる");
+    // 生ピアは読み取って捨てるだけで shutdown しない
+    let peer = spawn_discarding_peer(peer_io);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.close_and_wait(0x1234, "bye"),
+    )
+    .await
+    .expect("ピアの shutdown を待たずに close の送信が完了すること")
+    .expect("close の送信に成功すること");
+
+    // close の送信完了後も、ピアが shutdown しないためドライバは linger の期限まで
+    // 終了しない。close_and_wait がドライバの終了を待っていないことを確認する。
+    assert!(
+        !client.is_closed(),
+        "ドライバは linger の期限まで終了しないこと"
+    );
+
+    drop(client);
+
+    // ドライバをドロップしたら、ピアが EOF を観測して終了する
+    let (_eof_at, _peer_io) = tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+        .await
+        .expect("ピアが EOF を観測して終了すること")
+        .expect("ピアのタスクが終了すること");
+}
+
+#[tokio::test]
+async fn close_and_wait_sends_close_code_and_reason() {
+    // close_and_wait が送る CONNECTION_CLOSE のアプリケーションエラーコードと理由を
+    // ピアがそのまま観測できること。送信完了を待つだけで、ピアの shutdown は
+    // 待たない。
+    let (mut peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::new(Role::Client, client_io, config())
+        .expect("テスト用のクライアント接続を作成できる");
+    let mut peer = shiguredo_qmux::connection::Connection::new(Role::Server, config())
+        .expect("テスト用のピア接続を作成できる");
+    handshake_sans_io_peer(&mut peer_io, &mut peer).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.close_and_wait(0x1234, "bye"),
+    )
+    .await
+    .expect("close の送信が完了すること")
+    .expect("close の送信に成功すること");
+
+    // 送信済みの close に対してもう一度呼んでも、追加の close を送らずに成功する
+    client
+        .close_and_wait(0, "second")
+        .await
+        .expect("送信済みの close は再度成功すること");
+
+    // 送信完了を待ってから接続をドロップしても、CONNECTION_CLOSE は失われない。
+    // ドロップでドライバが終了しても、下位トランスポートへ書き出し済みのデータは
+    // ピアが読み取れる。
+    drop(client);
+
+    let reason = read_until_close(&mut peer_io, &mut peer).await;
+    match reason {
+        CloseReason::Peer {
+            application,
+            error_code,
+            reason,
+        } => {
+            assert!(application, "アプリケーションエラーであること");
+            assert_eq!(error_code, 0x1234, "close に渡したエラーコードが届くこと");
+            assert_eq!(reason, "bye", "close に渡した理由が届くこと");
+        }
+        other => panic!("ピアの切断を期待したが {other:?} だった"),
+    }
+}
+
+#[tokio::test]
+async fn close_and_wait_waits_for_pending_close_request() {
+    // close を先に呼んで close 要求が未処理のまま残っている場合、close_and_wait は
+    // 先行する要求の送信完了を待つ。2 回目のエラーコードと理由は使われない。
+    let (mut peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::new(Role::Client, client_io, config())
+        .expect("テスト用のクライアント接続を作成できる");
+    let mut peer = shiguredo_qmux::connection::Connection::new(Role::Server, config())
+        .expect("テスト用のピア接続を作成できる");
+    handshake_sans_io_peer(&mut peer_io, &mut peer).await;
+
+    client.close(0x99, "first").expect("close 要求を送れる");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.close_and_wait(0x1234, "second"),
+    )
+    .await
+    .expect("先行する close 要求の送信完了を待つこと")
+    .expect("close の送信に成功すること");
+
+    let reason = read_until_close(&mut peer_io, &mut peer).await;
+    match reason {
+        CloseReason::Peer {
+            application,
+            error_code,
+            reason,
+        } => {
+            assert!(application, "アプリケーションエラーであること");
+            assert_eq!(error_code, 0x99, "先行する close のコードが届くこと");
+            assert_eq!(reason, "first", "先行する close の理由が届くこと");
+        }
+        other => panic!("ピアの切断を期待したが {other:?} だった"),
+    }
+}
+
+#[tokio::test]
+async fn close_and_wait_fails_after_connection_is_closed() {
+    // 接続が既に閉じている場合は、close を送れないため ConnectionClosed を返す。
+    let (peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::new(Role::Client, client_io, config())
+        .expect("テスト用のクライアント接続を作成できる");
+    drop(peer_io);
+
+    let _reason = tokio::time::timeout(std::time::Duration::from_secs(2), client.closed())
+        .await
+        .expect("下位トランスポートの終了でドライバが終了すること");
+
+    let error = client
+        .close_and_wait(0, "late")
+        .await
+        .expect_err("閉じた接続への close は失敗すること");
+    assert!(
+        matches!(error, Error::ConnectionClosed),
+        "ConnectionClosed を期待したが {error:?} だった"
+    );
+}
+
+#[tokio::test]
+async fn close_and_wait_fails_while_connection_is_closing() {
+    // プロトコル違反で Closing になり、ピアが shutdown しないためドライバが linger で
+    // 待っている間は、新しい close 要求を受け付けられない。closed() の完了を待たずに
+    // close_and_wait が ConnectionClosed を返すことを検証する。
+    let (mut peer_io, client_io) = tokio::io::duplex(64 * 1024);
+    let client = Connection::with_linger(
+        Role::Client,
+        client_io,
+        config(),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("テスト用のクライアント接続を作成できる");
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let peer = tokio::spawn(async move {
+        // 空の Record は PROTOCOL_VIOLATION になり、クライアントは Closing へ移る
+        peer_io
+            .write_all(&[0x00])
+            .await
+            .expect("不正な Record を書き込める");
+        // クライアントが CONNECTION_CLOSE を書き出すまで Record を読み続ける。
+        // 最初の Record は QX_TRANSPORT_PARAMETERS である可能性があるため、
+        // フレームまでデコードして CONNECTION_CLOSE を確認する。
+        let mut decoder =
+            record::RecordDecoder::new(shiguredo_qmux::record::DEFAULT_MAX_RECORD_SIZE);
+        let mut scratch = [0u8; 1024];
+        loop {
+            let len = peer_io
+                .read(&mut scratch)
+                .await
+                .expect("ピアがクライアントの Record を読み取れる");
+            assert!(len > 0, "クライアントの shutdown より先に読めること");
+            decoder.extend(&scratch[..len]);
+            let mut saw_close = false;
+            while let Some(record) = decoder.poll_record().expect("Record をデコードできる")
+            {
+                for frame in
+                    shiguredo_qmux::frame::decode_record(&record).expect("フレームをデコードできる")
+                {
+                    if matches!(frame, QmuxFrame::Quic(QuicFrame::ConnectionClose(_))) {
+                        saw_close = true;
+                    }
+                }
+            }
+            if saw_close {
+                break;
+            }
+        }
+        let _ = observed_tx.send(());
+        // クライアントの linger を終わらせないよう、write 側を開いたまま待つ
+        let _ = release_rx.await;
+        peer_io
+    });
+
+    observed_rx
+        .await
+        .expect("クライアントが CONNECTION_CLOSE を送ること");
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.close_and_wait(0, "late"),
+    )
+    .await
+    .expect("linger の期限を待たずに返ること")
+    .expect_err("Closing 中の close 要求は受け付けないこと");
+    assert!(
+        matches!(error, Error::ConnectionClosed),
+        "ConnectionClosed を期待したが {error:?} だった"
+    );
+
+    drop(client);
+    let _ = release_tx.send(());
+    let _peer_io = tokio::time::timeout(std::time::Duration::from_secs(2), peer)
+        .await
+        .expect("ピアのタスクが終了すること")
+        .expect("ピアのタスクがパニックしないこと");
 }
 
 #[tokio::test]
@@ -1676,6 +1930,15 @@ async fn close_with_invalid_error_code_returns_error() {
     let (client, _server) = pair();
     let error = client
         .close(u64::MAX, "too large")
+        .expect_err("範囲外のエラーコードは受け付けない");
+    assert!(
+        matches!(error, Error::Qmux(QmuxError::InvalidData(_))),
+        "ローカルのエラーとして返ること: {error:?}"
+    );
+    // close_and_wait も同じ検証を要求を送る前に行う
+    let error = client
+        .close_and_wait(u64::MAX, "too large")
+        .await
         .expect_err("範囲外のエラーコードは受け付けない");
     assert!(
         matches!(error, Error::Qmux(QmuxError::InvalidData(_))),

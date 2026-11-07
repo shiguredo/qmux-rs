@@ -143,18 +143,42 @@ const READ_BUFFER_SIZE: usize = 64 * 1024;
 /// 長さである。[`Connection::with_linger`] で変更できる。
 pub const DEFAULT_LINGER: Duration = Duration::from_secs(3);
 
+/// CONNECTION_CLOSE の送信状態
+///
+/// [`Connection::close_and_wait`] が、close 要求の送信が完了したのか、接続が
+/// 既に閉じていて受け付けられなかったのかを区別するために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseSendState {
+    /// close 要求をまだ処理していない
+    Pending,
+    /// CONNECTION_CLOSE を書き出し、送信側を shutdown した
+    Sent,
+    /// close 要求を受け付けなかった (接続が既に閉じているなど)
+    Rejected,
+}
+
 /// QMux 接続
 ///
 /// 下位トランスポートを所有するドライバタスクを起動する。[`Connection`] を
 /// ドロップすると close 要求チャネルの送信側が閉じ、ドライバは下位トランスポートを
 /// 閉じて終了する (linger は待たない)。ストリームのハンドルが残っていても、ドライバ
 /// 自身がコマンド送信側を保持するため、コマンドチャネルは閉じない。
+///
+/// ドロップは close ではないため、CONNECTION_CLOSE を送らない。CONNECTION_CLOSE の
+/// 送信完了を待ってから終了する場合は [`Self::close_and_wait`] を使う。
 #[derive(Debug)]
 pub struct Connection {
     /// ドライバへのコマンド送信
     commands: mpsc::Sender<Command>,
     /// 接続を閉じる要求 (容量 1 の専用チャネル)
     close_request: mpsc::Sender<(u64, String)>,
+    /// CONNECTION_CLOSE の送信状態の通知
+    ///
+    /// ドライバが close 要求を受理した場合は、CONNECTION_CLOSE を含む Record を
+    /// 書き出して送信側の shutdown を試みた時点で [`CloseSendState::Sent`] に、
+    /// 受理できなかった場合は [`CloseSendState::Rejected`] になる。
+    /// [`Self::close_and_wait`] がこの状態を待つ。
+    close_state: watch::Receiver<CloseSendState>,
     /// ピア起動の双方向ストリームの受け取り
     ///
     /// 複数のタスクが `&self` で同時に待てるようにするため Mutex で包む。これは
@@ -253,6 +277,7 @@ impl Connection {
         let (stop_sending_tx, stop_sending_rx) = mpsc::channel(STOP_SENDING_CAPACITY);
         let (ping_ack_tx, ping_ack_rx) = mpsc::channel(STOP_SENDING_CAPACITY);
         let (closed_tx, closed_rx) = watch::channel(None);
+        let (close_state_tx, close_state_rx) = watch::channel(CloseSendState::Pending);
         let (peer_params_tx, peer_params_rx) = watch::channel(None);
         let (dropped_datagrams_tx, dropped_datagrams_rx) = watch::channel(0);
 
@@ -275,6 +300,8 @@ impl Connection {
             peer_params_tx,
             dropped_datagrams_tx,
             closed_tx,
+            close_state_tx,
+            close_requested: false,
             recv_streams: BTreeMap::new(),
             send_streams: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
@@ -311,6 +338,7 @@ impl Connection {
             peer_params: peer_params_rx,
             dropped_datagrams: dropped_datagrams_rx,
             closed: closed_rx,
+            close_state: close_state_rx,
         })
     }
 
@@ -538,11 +566,12 @@ impl Connection {
     /// ドライバは下位トランスポートを閉じて終了し、[`Self::closed`] が
     /// [`CloseReason::Local`] を返す。
     ///
-    /// このメソッドは要求を送るだけで、終了を待たない。終了状態は [`Self::closed`]
-    /// で確認する。すでに別の理由で閉じている場合 (ピアの切断を先に観測した場合など)
-    /// は、その理由が優先される。close 要求の送信に失敗した場合 (すでに未処理の
-    /// close 要求がある、またはドライバが終了している) も、接続は閉じる方向に
-    /// あるためエラーにしない。
+    /// このメソッドは要求を送るだけで、送信完了も終了も待たない。送信完了を待つ
+    /// 場合は [`Self::close_and_wait`]、終了状態は [`Self::closed`] を使う。すでに
+    /// 別の理由で閉じている場合 (ピアの切断を先に観測した場合など) は、その理由が
+    /// 優先される。close 要求の送信に失敗した場合 (すでに未処理の close 要求が
+    /// ある、またはドライバが終了している) も、接続は閉じる方向にあるため
+    /// エラーにしない。
     ///
     /// # エラー
     ///
@@ -550,15 +579,83 @@ impl Connection {
     /// 以下でなければならない (RFC 9000 Section 19.19)。超える値を渡した場合は
     /// [`Error::Qmux`] を返し、要求は送らない。
     pub fn close(&self, error_code: u64, reason: &str) -> Result<()> {
-        if error_code > shiguredo_qmux::codec::varint::MAX_VALUE {
-            return Err(Error::Qmux(QmuxError::InvalidData(format!(
-                "application error code {error_code} exceeds the maximum variable-length integer"
-            ))));
-        }
+        validate_close_error_code(error_code)?;
         let _ = self
             .close_request
             .try_send((error_code, reason.to_string()));
         Ok(())
+    }
+
+    /// 接続を閉じ、CONNECTION_CLOSE の送信完了を待つ
+    ///
+    /// [`Self::close`] と同じく CONNECTION_CLOSE を送るが、このメソッドは
+    /// CONNECTION_CLOSE を含む Record を下位トランスポートへ書き出し、送信側の
+    /// shutdown を試みた時点まで待つ。ピアの shutdown とドライバの終了は待たない
+    /// ため、[`Self::closed`] より早く返る。返った後に [`Connection`] をドロップ
+    /// しても、CONNECTION_CLOSE の送信は完了している。
+    ///
+    /// 下位トランスポートの送信バッファが詰まっている場合は、shutdown の完了を
+    /// linger の上限まで待つことがある。待つのは下位トランスポートへの書き出しと
+    /// shutdown の完了であり、ピアが CONNECTION_CLOSE を処理したことまでは保証
+    /// しない。
+    ///
+    /// 接続が既に閉じている場合、閉じる途中の場合、close を送れずにドライバが
+    /// 終了した場合は [`Error::ConnectionClosed`] を返す。すでに未処理の close
+    /// 要求がある場合は、その要求の完了を待つ。この呼び出しのエラーコードは
+    /// 使われない。
+    ///
+    /// # Cancel safety
+    ///
+    /// このメソッドは cancel safe である。待っている間に future を破棄しても、
+    /// close 要求は取り消されず、ドライバは close を継続する。
+    ///
+    /// # エラー
+    ///
+    /// `error_code` が可変長整数の上限 (2^62-1) を超える場合は [`Error::Qmux`] を
+    /// 返し、要求は送らない。接続が既に閉じている場合、閉じる途中の場合、close を
+    /// 送れずにドライバが終了した場合は [`Error::ConnectionClosed`] を返す。
+    pub async fn close_and_wait(&self, error_code: u64, reason: &str) -> Result<()> {
+        validate_close_error_code(error_code)?;
+
+        let mut close_state = self.close_state.clone();
+        let mut closed = self.closed.clone();
+        match *close_state.borrow() {
+            CloseSendState::Sent => return Ok(()),
+            CloseSendState::Rejected => return Err(Error::ConnectionClosed),
+            CloseSendState::Pending => {}
+        }
+        if closed.borrow().is_some() {
+            return Err(Error::ConnectionClosed);
+        }
+
+        // 先行する close 要求がある場合も、その要求の送信完了を待つ。容量 1 の
+        // チャネルが満杯でも、送信完了の通知は先行要求に対して行われる。
+        let _ = self
+            .close_request
+            .try_send((error_code, reason.to_string()));
+
+        loop {
+            match *close_state.borrow() {
+                CloseSendState::Sent => return Ok(()),
+                CloseSendState::Rejected => return Err(Error::ConnectionClosed),
+                CloseSendState::Pending => {}
+            }
+            if closed.borrow().is_some() {
+                return Err(Error::ConnectionClosed);
+            }
+            tokio::select! {
+                result = close_state.changed() => {
+                    if result.is_err() {
+                        return Err(Error::ConnectionClosed);
+                    }
+                }
+                result = closed.changed() => {
+                    if result.is_err() {
+                        return Err(Error::ConnectionClosed);
+                    }
+                }
+            }
+        }
     }
 
     /// 接続が閉じたかどうか
@@ -581,6 +678,10 @@ impl Connection {
     /// 複数の理由が競合した場合は、最初に確定した理由を返す。ドライバが理由を
     /// 通知せずに終了した場合も [`CloseReason::TransportClosed`] を返す。下位
     /// トランスポートの I/O エラーの詳細は保持しない。
+    ///
+    /// このメソッドはドライバの終了まで待つため、ピアが shutdown しない場合は
+    /// linger の上限まで返らない。CONNECTION_CLOSE の送信完了だけを待つ場合は
+    /// [`Self::close_and_wait`] を使う。
     ///
     /// # Cancel safety
     ///
@@ -633,6 +734,14 @@ struct Driver<T> {
     dropped_datagrams_tx: watch::Sender<u64>,
     /// 接続が閉じた理由の通知
     closed_tx: watch::Sender<Option<CloseReason>>,
+    /// CONNECTION_CLOSE の送信状態の通知
+    close_state_tx: watch::Sender<CloseSendState>,
+    /// close 要求を処理したかどうか
+    ///
+    /// CONNECTION_CLOSE を含む Record を書き出して送信側を shutdown した時点で、
+    /// [`Self::close_state_tx`] を [`CloseSendState::Sent`] にする対象かを判定する
+    /// ために使う。
+    close_requested: bool,
     /// ストリーム ID から受信イベント送信への対応
     recv_streams: BTreeMap<StreamId, mpsc::Sender<StreamEvent>>,
     /// ストリーム ID から送信イベント送信への対応
@@ -809,6 +918,16 @@ where
                     self.transport_ended = true;
                 }
             }
+            // close 要求が処理され、CONNECTION_CLOSE を含む Record を書き出して
+            // 送信側の shutdown まで進んだら、送信完了を待つ利用者へ通知する。
+            // ピアの shutdown とドライバの終了は待たない。
+            if self.close_requested
+                && self.write_shutdown
+                && self.written >= self.output.len()
+                && matches!(self.close_reason.as_ref(), Some(CloseReason::Local { .. }))
+            {
+                let _ = self.close_state_tx.send(CloseSendState::Sent);
+            }
             // 終了判定。自側の close とアイドルタイムアウトでは、送信側を shutdown
             // した後でピアの shutdown を待つ (draft-ietf-quic-qmux-02 Section 7.2 の
             // SHOULD)。ピア起因の切断では、自側の shutdown が済み次第終了する
@@ -912,10 +1031,26 @@ where
                     self.transport_ended = true;
                 }
                 Wake::Close(Some((error_code, reason))) => {
-                    // Sans I/O 側は可変長整数の範囲を超えるアプリケーションエラー
-                    // コードを受け付けない。その場合も接続は閉じないため、要求は
-                    // 無視される (呼び出し側は範囲内のコードで再度 close できる)。
-                    let _ = self.connection.close(error_code, &reason);
+                    // 先に受理した close 要求がある場合は、その送信完了を待つ。
+                    // 後続の要求は CONNECTION_CLOSE を重ねないため無視する。
+                    if !self.close_requested {
+                        if self.connection.is_closed() {
+                            // すでに閉じている場合は、その理由が優先される。
+                            // close 要求を重ねても CONNECTION_CLOSE は送られない
+                            // ため、待ち手には受け付けなかったことを通知する。
+                            let _ = self.close_state_tx.send(CloseSendState::Rejected);
+                        } else if self.connection.close(error_code, &reason).is_ok() {
+                            self.close_requested = true;
+                            // 以前の要求が拒否されていても、この要求は受理した
+                            // ため、待ち手が監視できる状態へ戻す。
+                            let _ = self.close_state_tx.send(CloseSendState::Pending);
+                        } else {
+                            // アプリケーションエラーコードの検証は公開 API で
+                            // 済んでいるため、ここに来るのは実装の不整合である。
+                            // 待ち手を解放するために拒否を通知する。
+                            let _ = self.close_state_tx.send(CloseSendState::Rejected);
+                        }
+                    }
                 }
                 Wake::Close(None) => {
                     // Connection がドロップされた (close 要求チャネルの送信側が消えた)
@@ -1417,7 +1552,9 @@ where
     ///
     /// アプリケーションがデータを受け取らないため、ピアへ送信停止 (STOP_SENDING) を
     /// 要求し、以後このストリームを読まない (RFC 9000 Section 3.5)。エラーコードは
-    /// アプリケーション固有の値で、ここでは 0 (NO_ERROR) を使う。
+    /// アプリケーション固有の値で、ここでは 0 (NO_ERROR) を使う。明示的な
+    /// `stop_sending` を送信済みのストリームでは、コアが 2 回目以降の要求を無視する
+    /// ため、追加の STOP_SENDING は送られない。
     fn drop_recv_stream(&mut self, id: StreamId) {
         self.recv_streams.remove(&id);
         self.pending_readable.remove(&id);
@@ -1563,6 +1700,19 @@ where
             .unwrap_or(CloseReason::TransportClosed);
         let _ = self.closed_tx.send(Some(reason));
     }
+}
+
+/// アプリケーションエラーコードが可変長整数で表現できるか検査する
+///
+/// CONNECTION_CLOSE のエラーコードは可変長整数でなければならない
+/// (RFC 9000 Section 19.19)。範囲外の値はドライバへ渡す前に拒否する。
+fn validate_close_error_code(error_code: u64) -> Result<()> {
+    if error_code > shiguredo_qmux::codec::varint::MAX_VALUE {
+        return Err(Error::Qmux(QmuxError::InvalidData(format!(
+            "application error code {error_code} exceeds the maximum variable-length integer"
+        ))));
+    }
+    Ok(())
 }
 
 /// ピアのストリーム数上限に達したことによるエラーかどうか

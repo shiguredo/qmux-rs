@@ -115,6 +115,10 @@ async fn main() -> Result<(), shiguredo_tokio_qmux::Error> {
 [crates/tokio-qmux/examples/basic.rs](https://github.com/shiguredo/qmux-rs/blob/develop/crates/tokio-qmux/examples/basic.rs)
 にあります。
 
+接続を閉じる場合は `Connection::close_and_wait` を使うと、CONNECTION_CLOSE の送信が
+完了してから接続を終了できます。`Connection` のドロップだけでは CONNECTION_CLOSE は
+送られません。
+
 ## テスト
 
 ```bash

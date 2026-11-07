@@ -34,5 +34,9 @@ async fn main() -> Result<(), shiguredo_tokio_qmux::Error> {
     let mut buf = [0u8; 5];
     assert_eq!(recv.read(&mut buf).await?, Some(5));
     println!("received: {}", String::from_utf8_lossy(&buf));
+
+    // 接続を閉じる場合は close_and_wait を使う。Connection の drop だけでは
+    // CONNECTION_CLOSE が送られないため、送信完了を待ってから終了する。
+    client.close_and_wait(0, "example finished").await?;
     Ok(())
 }

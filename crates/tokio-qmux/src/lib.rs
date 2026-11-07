@@ -10,8 +10,8 @@
 //! 複数タスクからの利用を想定し、待ち受ける系のメソッド ([`Connection::accept_bidirectional`]、
 //! [`Connection::accept_unidirectional`]、[`Connection::recv_datagram`]、
 //! [`Connection::recv_datagrams`]、[`Connection::recv_stop_sending`]、
-//! [`Connection::recv_ping_ack`]、[`Connection::closed`]) は `&self` を取り、`select!` の
-//! 腕に置いても安全な cancel safety を持つ。
+//! [`Connection::recv_ping_ack`]、[`Connection::closed`]) は `&self` を取り、
+//! `select!` の腕に置いても安全な cancel safety を持つ。
 //!
 //! TLS と ALPN のネゴシエーションは呼び出し側の責務である。[`Connection::new`] には
 //! 接続済みの双方向バイトストリームを渡す。QMux over TLS では、アプリケーションは
@@ -40,6 +40,12 @@
 //! トランスポートを閉じて終了し、[`Connection::closed`] が
 //! [`shiguredo_qmux::event::CloseReason::Local`] を返す。
 //!
+//! [`Connection::close`] は要求を送るだけで、送信完了も終了も待たない。
+//! CONNECTION_CLOSE の送信完了を待ってから [`Connection`] をドロップする場合は
+//! [`Connection::close_and_wait`] を使う。これは CONNECTION_CLOSE を含む Record を
+//! 書き出し、送信側の shutdown を試みた時点で返る。ピアの shutdown とドライバの
+//! 終了は待たない。
+//!
 //! アイドルタイムアウト (Section 7.1) でも、QMux フレームを新たに送らずに送信側を
 //! shutdown し、自側の close と同じくピアの shutdown を linger の上限まで待つ
 //! (Section 7.2)。終了が確定した時点でまだ書き出していない Record は破棄する。
@@ -53,7 +59,16 @@
 //! 返す。読み取りエラー (TCP のリセット、TLS の fatal alert など) は下位
 //! トランスポートの閉塞 (Section 7.4) として即座に終了し、
 //! [`shiguredo_qmux::event::CloseReason::TransportClosed`] を返す。[`Connection`] を
-//! ドロップした場合は linger を待たずに下位トランスポートを閉じて終了する。
+//! ドロップした場合は linger を待たずに下位トランスポートを閉じて終了する。ドロップは
+//! close ではないため、CONNECTION_CLOSE を送らない。CONNECTION_CLOSE を送る場合は
+//! [`Connection::close`] または [`Connection::close_and_wait`] を使う。
+//!
+//! # ストリーム
+//!
+//! [`RecvStream`] をドロップすると、アプリケーションがもうデータを受け取らない
+//! ものとしてコード 0 (NO_ERROR) の STOP_SENDING を送る。明示的に
+//! [`RecvStream::stop_sending`] を送信済みのストリームでは、コアが 2 回目以降の
+//! 要求を無視するため、追加の STOP_SENDING を送らない。
 //!
 //! # QUIC の上で動かす場合との違い
 //!
