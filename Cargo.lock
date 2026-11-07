@@ -304,9 +304,9 @@ dependencies = [
  "rcgen",
  "rustls",
  "shiguredo_qmux",
+ "shiguredo_tokio_qmux",
  "tokio",
  "tokio-dwnx",
- "tokio-qmux",
  "tokio-rustls",
 ]
 
@@ -699,6 +699,14 @@ name = "shiguredo_qmux"
 version = "2026.0.0"
 
 [[package]]
+name = "shiguredo_tokio_qmux"
+version = "0.0.0"
+dependencies = [
+ "shiguredo_qmux",
+ "tokio",
+]
+
+[[package]]
 name = "shiguredo_toml"
 version = "2026.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -865,14 +873,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "tokio-qmux"
-version = "0.0.0"
-dependencies = [
- "shiguredo_qmux",
- "tokio",
 ]
 
 [[package]]

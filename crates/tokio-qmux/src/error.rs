@@ -1,10 +1,10 @@
-//! tokio-qmux のエラー
+//! shiguredo_tokio_qmux のエラー
 
 use core::fmt;
 
 use shiguredo_qmux::codec::error::Error as QmuxError;
 
-/// tokio-qmux のエラー
+/// shiguredo_tokio_qmux のエラー
 ///
 /// 下位トランスポートの I/O エラーの詳細 (EOF、ECONNRESET、TLS の fatal alert
 /// など) はこの型では保持しない。ドライバは読み取り・書き込みの I/O エラーを
@@ -58,5 +58,5 @@ impl From<QmuxError> for Error {
     }
 }
 
-/// tokio-qmux の結果型
+/// shiguredo_tokio_qmux の結果型
 pub type Result<T> = core::result::Result<T, Error>;

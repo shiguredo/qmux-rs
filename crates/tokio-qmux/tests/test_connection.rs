@@ -1,4 +1,4 @@
-//! tokio-qmux の非同期 I/O 結合テスト
+//! shiguredo_tokio_qmux の非同期 I/O 結合テスト
 //!
 //! `tokio::io::duplex` で接続した 2 つの [`Connection`] を使い、ストリーム、
 //! DATAGRAM、切断を検証する。
@@ -15,8 +15,8 @@ use shiguredo_qmux::config::Config;
 use shiguredo_qmux::event::CloseReason;
 use shiguredo_qmux::frame::QmuxFrame;
 use shiguredo_qmux::record;
+use shiguredo_tokio_qmux::{Connection, Error, RecvStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_qmux::{Connection, Error, RecvStream};
 
 /// テスト用の設定
 fn config() -> Config {

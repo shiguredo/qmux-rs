@@ -47,16 +47,16 @@ QMux 自体は暗号化も認証も行いません。接続の確立、秘匿、
 
 ## tokio ラッパーの切断
 
-`crates/tokio-qmux` のドライバは、`tokio_qmux::Connection::close` の要求を受けると
+`crates/tokio-qmux` のドライバは、`shiguredo_tokio_qmux::Connection::close` の要求を受けると
 CONNECTION_CLOSE を送り、下位トランスポートの送信側を graceful に shutdown し、
 ピアが送信側を shutdown するのを待ちます (draft-ietf-quic-qmux-02 Section 7.2)。
 
-この待ち時間には上限 (linger) があり、既定値は `tokio_qmux::DEFAULT_LINGER` (3 秒)
-です。`tokio_qmux::Connection::with_linger` で変更できます。
+この待ち時間には上限 (linger) があり、既定値は `shiguredo_tokio_qmux::DEFAULT_LINGER` (3 秒)
+です。`shiguredo_tokio_qmux::Connection::with_linger` で変更できます。
 
 ピアが shutdown しない場合も、ピアが読み取りを止めて送信が詰まった場合も、期限を
 過ぎるとドライバは下位トランスポートを閉じて終了します。このとき
-`tokio_qmux::Connection::closed` は `shiguredo_qmux::event::CloseReason::Local` を
+`shiguredo_tokio_qmux::Connection::closed` は `shiguredo_qmux::event::CloseReason::Local` を
 返します。
 
 ピアが送ってきた CONNECTION_CLOSE (Section 7.3) では、ドライバは下位トランスポートの
@@ -66,7 +66,7 @@ CONNECTION_CLOSE を送り、下位トランスポートの送信側を graceful
 
 読み取りで EOF を観測した場合 (ピアが送信側を shutdown した場合、Section 7.3) は、
 `shiguredo_qmux::connection::Connection::peer_shutdown` で接続を閉じ、自側の送信側を
-graceful に shutdown して終了します。このとき `tokio_qmux::Connection::closed` は
+graceful に shutdown して終了します。このとき `shiguredo_tokio_qmux::Connection::closed` は
 `shiguredo_qmux::event::CloseReason::PeerShutdown` を返します。読み取りエラーや
 書き込みエラーは Section 7.4 の閉塞として `CloseReason::TransportClosed` を返します。
 
@@ -74,29 +74,29 @@ graceful に shutdown して終了します。このとき `tokio_qmux::Connecti
 を破棄します。下位トランスポートへの書き込みが途中の Record は境界を壊さないため
 完遂します。
 
-`tokio_qmux::Connection` をドロップした場合も、ドライバは linger の期限を待たずに
+`shiguredo_tokio_qmux::Connection` をドロップした場合も、ドライバは linger の期限を待たずに
 下位トランスポートを閉じて終了します。この上限は close の後にピアの shutdown を
 待つ間の打ち切りであり、ドロップによる終了を遅らせるものではありません。
 
 ## tokio ラッパーのストリーム
 
-`tokio_qmux::RecvStream` をドロップすると、アプリケーションがもうデータを受け取らない
+`shiguredo_tokio_qmux::RecvStream` をドロップすると、アプリケーションがもうデータを受け取らない
 ものとして、ドライバはピアへ STOP_SENDING を送ります (RFC 9000 Section 3.5)。
 アプリケーションが受け取らないデータをピアに送り続けさせないためです。ただし、
 FIN または RESET_STREAM を配送済みのストリームと、ドライバのコマンドチャネルが満杯の
 場合は STOP_SENDING を送らないことがあります。
 
-`tokio_qmux::SendStream` の `write` は、FIN または RESET_STREAM を送った後に
-`tokio_qmux::Error::StreamFinished` を返します。ピアの STOP_SENDING で送信側が終端した
-後は `tokio_qmux::Error::Stopped(error_code)` を返します。DATAGRAM を送れない場合は
-`tokio_qmux::Connection::send_datagram` が `Err` を返します。
+`shiguredo_tokio_qmux::SendStream` の `write` は、FIN または RESET_STREAM を送った後に
+`shiguredo_tokio_qmux::Error::StreamFinished` を返します。ピアの STOP_SENDING で送信側が終端した
+後は `shiguredo_tokio_qmux::Error::Stopped(error_code)` を返します。DATAGRAM を送れない場合は
+`shiguredo_tokio_qmux::Connection::send_datagram` が `Err` を返します。
 
-`tokio_qmux::Connection::open_bidirectional` / `open_unidirectional` は、ピアの
+`shiguredo_tokio_qmux::Connection::open_bidirectional` / `open_unidirectional` は、ピアの
 ストリーム上限に達している場合、ピアが MAX_STREAMS を送るまで待ちます。待機中に
-接続が閉じた場合は `tokio_qmux::Error::ConnectionClosed` を返します。
+接続が閉じた場合は `shiguredo_tokio_qmux::Error::ConnectionClosed` を返します。
 
-`tokio_qmux::Connection::close` は `Result<()>` を返し、アプリケーションエラーコードが
-可変長整数の上限 (2^62-1) を超える場合は `tokio_qmux::Error::Qmux` を返します。
+`shiguredo_tokio_qmux::Connection::close` は `Result<()>` を返し、アプリケーションエラーコードが
+可変長整数の上限 (2^62-1) を超える場合は `shiguredo_tokio_qmux::Error::Qmux` を返します。
 
 ## 仕様との対応
 
@@ -106,13 +106,13 @@ FIN または RESET_STREAM を配送済みのストリームと、ドライバ�
 | Section 4 利用できるフレーム | `frame.rs`。禁止フレームと未知フレームは FRAME_ENCODING_ERROR |
 | Section 4.1 STREAM の順序 | `stream.rs`。直前のペイロードに連続しないオフセットは PROTOCOL_VIOLATION |
 | Section 4.2 QX_TRANSPORT_PARAMETERS | `frame.rs` / `connection.rs`。最初のフレーム以外は PROTOCOL_VIOLATION。最初のフレームが禁止フレームまたは未知フレームの場合は Section 4 の FRAME_ENCODING_ERROR を優先する (仕様内で MUST が衝突するため) |
-| Section 4.3 QX_PING | `connection.rs`。要求のシーケンス番号は厳密増加。応答は自動送信。tokio 側は `tokio_qmux::Connection::recv_ping_ack` で応答を待てる |
+| Section 4.3 QX_PING | `connection.rs`。要求のシーケンス番号は厳密増加。応答は自動送信。tokio 側は `shiguredo_tokio_qmux::Connection::recv_ping_ack` で応答を待てる |
 | Section 5.1 許可 / 禁止パラメータ | `transport_params.rs`。禁止パラメータは TRANSPORT_PARAMETER_ERROR |
 | Section 5.2 max_record_size | `record.rs` / `transport_params.rs`。既定値 16382、既定値未満は TRANSPORT_PARAMETER_ERROR |
 | Section 6 Forward Progress | `receive` はアプリケーションの読み取りと独立に Record を処理する |
 | Section 7.1 アイドルタイムアウト | `connection.rs`。実効値は両端の 0 でない値の最小値。ブロック中で実効アイドルタイムアウトが有効な場合は `DATA_BLOCKED` / `STREAM_DATA_BLOCKED` を 1 秒間隔で再送する (`next_timeout` / `handle_timeout`) |
 | Section 7.2 / 7.3 切断 | `connection.rs` / `crates/tokio-qmux`。CONNECTION_CLOSE の送受信、切断後のデータ破棄、EOF の `CloseReason::PeerShutdown` 通知、tokio 側の linger 待ち (「tokio ラッパーの切断」参照) |
-| Section 8.1 ALPN | 下位トランスポートの責務であり、`shiguredo_qmux` は関与しない。tokio-qmux の doc に利用者が負う MUST (未ネゴシエート時のハンドシェイク中止、QUIC マッピングと異なる識別子) を記載し、interop が ALPN 不一致の負の経路を検証する |
+| Section 8.1 ALPN | 下位トランスポートの責務であり、`shiguredo_qmux` は関与しない。`shiguredo_tokio_qmux` の doc に利用者が負う MUST (未ネゴシエート時のハンドシェイク中止、QUIC マッピングと異なる識別子) を記載し、interop が ALPN 不一致の負の経路を検証する |
 | Section 8.2 0-RTT | 未実装。remembered transport parameters を扱わない (詳細は「未実装」節) |
 | Section 9.1 DATAGRAM 拡張 | `connection.rs`。送信は `max_datagram_frame_size` と `max_record_size` の両方で上限を検査し、受信は広告した上限の超過と非サポート時の受信を PROTOCOL_VIOLATION とする |
 | Section 9.2 RESET_STREAM_AT | 未対応。`reset_stream_at` を広告せず、受信した RESET_STREAM_AT は未知のフレームタイプとして FRAME_ENCODING_ERROR で扱う (詳細は「未実装」節) |

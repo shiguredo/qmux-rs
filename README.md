@@ -45,7 +45,7 @@ QUIC version 1 のストリーム操作とデータグラム操作を提供す�
 | クレート | 役割 |
 | --- | --- |
 | `shiguredo_qmux` | Sans I/O & no_std + alloc の QMux 実装 |
-| `crates/tokio-qmux` | `shiguredo_qmux` の tokio 非同期ラッパー |
+| `shiguredo_tokio_qmux` (`crates/tokio-qmux`) | `shiguredo_qmux` の tokio 非同期ラッパー |
 | `crates/dwnx-sys` | dwnx の C ソースを clone してビルドし、FFI 宣言を生成する |
 | `crates/dwnx-rs` | `dwnx_conn` の安全な Sans I/O ラッパー |
 | `crates/tokio-dwnx` | `dwnx-rs` の tokio 非同期ラッパー |
@@ -82,10 +82,10 @@ assert_eq!(server.poll_event(), Some(Event::TransportParametersReceived));
 ```rust
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::config::Config;
-use tokio_qmux::Connection;
+use shiguredo_tokio_qmux::Connection;
 
 #[tokio::main]
-async fn main() -> Result<(), tokio_qmux::Error> {
+async fn main() -> Result<(), shiguredo_tokio_qmux::Error> {
     // Config::default() はフロー制御のクレジットが 0 でデータを送れないため、明示的に設定する
     let config = Config {
         initial_max_data: 64 * 1024,

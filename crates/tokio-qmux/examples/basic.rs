@@ -1,13 +1,13 @@
-//! `tokio::io::duplex` で接続した 2 つの [`tokio_qmux::Connection`] の最小例。
+//! `tokio::io::duplex` で接続した 2 つの [`shiguredo_tokio_qmux::Connection`] の最小例。
 //!
-//! 実行: `cargo run -p tokio-qmux --example basic`
+//! 実行: `cargo run -p shiguredo_tokio_qmux --example basic`
 
 use shiguredo_qmux::codec::role::Role;
 use shiguredo_qmux::config::Config;
-use tokio_qmux::Connection;
+use shiguredo_tokio_qmux::Connection;
 
 #[tokio::main]
-async fn main() -> Result<(), tokio_qmux::Error> {
+async fn main() -> Result<(), shiguredo_tokio_qmux::Error> {
     // Config::default() はフロー制御のクレジットが 0 で何も送れないため、
     // ストリームを使う場合は明示的に設定する。
     let config = Config {

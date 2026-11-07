@@ -1,4 +1,4 @@
-//! QMux (tokio-qmux) と dwnx (tokio-dwnx) の tokio + TLS 相互接続テスト
+//! QMux (shiguredo_tokio_qmux) と dwnx (tokio-dwnx) の tokio + TLS 相互接続テスト
 //!
 //! TCP + TLS (rustls + aws-lc-sys) + ALPN で接続し、クライアントから
 //! 双方向ストリームでデータを送り、サーバーがエコーを返すことを検証する。
@@ -15,8 +15,8 @@ use dwnx_rs::TransportParameters as DwnxTransportParameters;
 use shiguredo_qmux::codec::role::Role as QmuxRole;
 use shiguredo_qmux::codec::time::Duration as QmuxDuration;
 use shiguredo_qmux::config::Config as QmuxConfig;
+use shiguredo_tokio_qmux::Connection as QmuxConnection;
 use tokio_dwnx::Role as DwnxRole;
-use tokio_qmux::Connection as QmuxConnection;
 
 /// テストで使う ALPN 識別子
 ///
@@ -154,8 +154,8 @@ async fn with_guard<T>(future: impl std::future::Future<Output = T>) -> T {
     }
 }
 
-/// tokio-qmux のストリームを終端まで読み取る
-async fn read_all_qmux(recv: &mut tokio_qmux::RecvStream) -> Vec<u8> {
+/// shiguredo_tokio_qmux のストリームを終端まで読み取る
+async fn read_all_qmux(recv: &mut shiguredo_tokio_qmux::RecvStream) -> Vec<u8> {
     let mut data = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
@@ -322,7 +322,7 @@ async fn datagram_roundtrip_over_tls() {
     let connection =
         QmuxConnection::new(QmuxRole::Client, tls, qmux_config()).expect("QMux 接続を作成できる");
 
-    // tokio-qmux クライアントから tokio-dwnx サーバーへ DATAGRAM が届くこと
+    // shiguredo_tokio_qmux クライアントから tokio-dwnx サーバーへ DATAGRAM が届くこと
     with_guard(connection.send_datagram(b"hello datagram"))
         .await
         .expect("DATAGRAM を送れる");
@@ -350,8 +350,8 @@ async fn datagram_roundtrip_over_tls() {
 
 #[tokio::test]
 async fn dwnx_client_qmux_server_over_tls() {
-    // 逆方向の役割の組み合わせ: tokio-dwnx クライアントから tokio-qmux サーバーへ
-    // TLS で接続する。tokio-dwnx の open / finish / close (linger) と tokio-qmux の
+    // 逆方向の役割の組み合わせ: tokio-dwnx クライアントから shiguredo_tokio_qmux サーバーへ
+    // TLS で接続する。tokio-dwnx の open / finish / close (linger) と shiguredo_tokio_qmux の
     // accept の組み合わせを、ストリームと DATAGRAM の両方で検証する。
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -422,7 +422,7 @@ async fn dwnx_client_qmux_server_over_tls() {
     let connection = tokio_dwnx::Connection::new(DwnxRole::Client, tls, dwnx_config())
         .expect("QMux 接続を作成できる");
 
-    // tokio-dwnx クライアントから tokio-qmux サーバーへ双方向ストリームで送る
+    // tokio-dwnx クライアントから shiguredo_tokio_qmux サーバーへ双方向ストリームで送る
     let (mut send, mut recv) = with_guard(connection.open_bidirectional())
         .await
         .expect("ストリームを開ける");
@@ -444,7 +444,7 @@ async fn dwnx_client_qmux_server_over_tls() {
         .expect("エコーの DATAGRAM が届く");
     assert_eq!(
         echoed, b"dwnx datagram",
-        "tokio-qmux がエコーした DATAGRAM が一致すること"
+        "shiguredo_tokio_qmux がエコーした DATAGRAM が一致すること"
     );
 
     // tokio-dwnx の close (linger) でサーバーが接続の終了を観測すること

@@ -71,9 +71,9 @@
 //! ```
 //! use shiguredo_qmux::codec::role::Role;
 //! use shiguredo_qmux::config::Config;
-//! use tokio_qmux::Connection;
+//! use shiguredo_tokio_qmux::Connection;
 //!
-//! # async fn example() -> Result<(), tokio_qmux::Error> {
+//! # async fn example() -> Result<(), shiguredo_tokio_qmux::Error> {
 //! let config = Config {
 //!     initial_max_data: 64 * 1024,
 //!     initial_max_stream_data_bidi_local: 16 * 1024,

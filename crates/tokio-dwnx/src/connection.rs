@@ -624,7 +624,7 @@ impl Driver {
     ///
     /// 読み取り・書き込み・コマンド・close 要求・タイマーを 1 つの `select!` で待つ。
     /// 書き込みが詰まっている間も他の腕が動くため、ピアが読み取りを止めても受信・
-    /// コマンド・アイドルタイムアウトが進む (tokio-qmux と同じ設計)。
+    /// コマンド・アイドルタイムアウトが進む (shiguredo_tokio_qmux と同じ設計)。
     async fn run(mut self) {
         let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
 

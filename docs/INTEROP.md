@@ -58,12 +58,12 @@ TCP + TLS (rustls + aws-lc-sys) + ALPN で接続し、次を検証します。
 
 - ALPN がネゴシエートされること
 - ALPN が一致しない場合に TLS ハンドシェイクが失敗すること (no_application_protocol)
-- `tokio-qmux` クライアントから `tokio-dwnx` サーバーへ双方向ストリームでデータが届くこと
+- `shiguredo_tokio_qmux` クライアントから `tokio-dwnx` サーバーへ双方向ストリームでデータが届くこと
 - サーバーが返したエコーがクライアントに届くこと
-- `tokio-qmux` と `tokio-dwnx` の間で DATAGRAM が往復すること (空の DATAGRAM を含む)
-- 逆向きの役割の組み合わせ (`tokio-dwnx` クライアントから `tokio-qmux` サーバー) でも、
+- `shiguredo_tokio_qmux` と `tokio-dwnx` の間で DATAGRAM が往復すること (空の DATAGRAM を含む)
+- 逆向きの役割の組み合わせ (`tokio-dwnx` クライアントから `shiguredo_tokio_qmux` サーバー) でも、
   双方向ストリームのエコーと DATAGRAM の往復が成立すること
-  - `tokio-dwnx` の open / finish / close (linger) と `tokio-qmux` の accept の組み合わせを
+  - `tokio-dwnx` の open / finish / close (linger) と `shiguredo_tokio_qmux` の accept の組み合わせを
     検証する
 
 テストで使う ALPN 識別子は「ALPN 識別子」節を参照してください。証明書は `rcgen` で
@@ -89,7 +89,7 @@ ALPN を扱いません。QMux 上で動かすアプリケーションプロト�
     ALPN が定義された時点で見直す
   - 同一 ALPN の間は、QMux 非対応のサーバーに TCP で接続しても TLS は成功するため、
     QMux のトランスポートパラメータ待ちを検知する必要がある。`shiguredo_qmux` と
-    `tokio-qmux` にはハンドシェイク専用のタイムアウトは無い。検知は利用者の責務であり、
+    `shiguredo_tokio_qmux` にはハンドシェイク専用のタイムアウトは無い。検知は利用者の責務であり、
     `Config::max_idle_timeout` を設定するか、ALPN を検査して接続を中止する。加えて、
     SVCB で QUIC 用と QMux 用を区別できず、0-RTT のチケットも ALPN で分離されない
 - 相互接続テスト: `hqx-01`
@@ -166,7 +166,7 @@ cargo test -p interop --test tokio_tls
   `tokio_dwnx::Connection::with_linger` で変更できる。上限を過ぎると、ドライバは
   下位トランスポートを閉じて終了する
 - 下位トランスポートの閉塞 (Section 7.4) では shutdown せずに即座に終了する
-- `Connection::closed` は終了理由を返さない (tokio-qmux の `Connection::closed` は
+- `Connection::closed` は終了理由を返さない (shiguredo_tokio_qmux の `Connection::closed` は
   `CloseReason` を返す)
 - 受信したストリームデータのフロー制御クレジットは、アプリケーションへの配送が成功した
   時点で返す。未配送のイベントはクレジットを返さないため、配送待ちキューはフロー制御で

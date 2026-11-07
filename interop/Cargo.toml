@@ -19,5 +19,5 @@ shiguredo_qmux = { path = ".." }
 tokio = { version = "1.53", features = ["full"] }
 tokio-dwnx = { path = "../crates/tokio-dwnx" }
 # 非同期 I/O ありの検証
-tokio-qmux = { path = "../crates/tokio-qmux" }
+shiguredo_tokio_qmux = { path = "../crates/tokio-qmux" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
