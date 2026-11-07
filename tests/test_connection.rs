@@ -634,6 +634,89 @@ mod streams {
     }
 
     #[test]
+    fn local_stop_sending_is_idempotent() {
+        // RFC 9000 Section 3.5: 受信側をあきらめたことを示す STOP_SENDING は、
+        // 同じストリームへ重ねて送る必要がない。QMux の下位トランスポートは
+        // フレームを落とさないため、2 回目以降はフレームを送らない。
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        let id = pair.client.open_bidi().expect("ストリームを開ける");
+        pair.client.write(id, b"data", false).expect("書き込める");
+        pair.transfer();
+        let (data, _) = read_all(&mut pair.server, id);
+        assert_eq!(data, b"data", "データが届くこと");
+
+        // 1 回目は指定したアプリケーションエラーコードで送る
+        pair.server
+            .stop_sending(id, 0x99)
+            .expect("STOP_SENDING を送れる");
+        let frames = take_frames(&mut pair.server);
+        let stop_sending: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                QmuxFrame::Quic(Frame::StopSending(frame)) => Some(frame),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stop_sending.len(),
+            1,
+            "STOP_SENDING が 1 本だけ送られること: {frames:?}"
+        );
+        assert_eq!(
+            stop_sending[0].application_protocol_error_code, 0x99,
+            "最初に指定したエラーコードが送られること"
+        );
+
+        // 2 回目はエラーコードが違っても、追加のフレームを送らない
+        pair.server
+            .stop_sending(id, 0)
+            .expect("2 回目の STOP_SENDING も成功すること");
+        let frames = take_frames(&mut pair.server);
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, QmuxFrame::Quic(Frame::StopSending(_)))),
+            "2 回目の STOP_SENDING を送らないこと: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn local_stop_sending_after_peer_reset_is_idempotent() {
+        // 1 回目の STOP_SENDING に対してピアが RESET_STREAM を返した後でも、
+        // 2 回目の stop_sending は最初の要求の重複として扱い、エラーにしない。
+        // ピアがリセットを返した後は新しい STOP_SENDING を送れないが、すでに
+        // 受信をあきらめているアプリケーションの再呼び出しは成功させる。
+        let mut pair = Pair::new();
+        pair.handshake();
+
+        let id = pair.client.open_bidi().expect("ストリームを開ける");
+        pair.client.write(id, b"data", false).expect("書き込める");
+        pair.transfer();
+        let (data, _) = read_all(&mut pair.server, id);
+        assert_eq!(data, b"data", "データが届くこと");
+
+        pair.server
+            .stop_sending(id, 0x99)
+            .expect("STOP_SENDING を送れる");
+        // ピアが RESET_STREAM を返すまで Record を往復させる
+        pair.transfer();
+        pair.transfer();
+
+        pair.server
+            .stop_sending(id, 0)
+            .expect("ピアのリセット後でも 2 回目の要求は成功すること");
+        let frames = take_frames(&mut pair.server);
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, QmuxFrame::Quic(Frame::StopSending(_)))),
+            "リセット後に追加の STOP_SENDING を送らないこと: {frames:?}"
+        );
+    }
+
+    #[test]
     fn application_reset_is_reported_to_peer() {
         let mut pair = Pair::new();
         pair.handshake();

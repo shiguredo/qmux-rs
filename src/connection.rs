@@ -615,6 +615,15 @@ impl Connection {
     /// 埋まり続けることはない。破棄したデータについて
     /// [`Event::StreamReadable`] は通知しない。
     ///
+    /// 同じストリームに対して 2 回目以降に呼び出した場合は、最初に送信した
+    /// アプリケーションエラーコードを維持し、追加の STOP_SENDING を送らない。
+    /// QMux の下位トランスポートは順序保証された信頼的なバイトストリームであり、
+    /// RFC 9000 Section 3.5 が想定する STOP_SENDING の再送は不要である。
+    ///
+    /// ピアがすでに RESET_STREAM を送っている場合、まだ STOP_SENDING を送って
+    /// いなければ [`Error::Protocol`] (STREAM_STATE_ERROR) を返す
+    /// (RFC 9000 Section 3.3)。
+    ///
     /// アプリケーションがすべてのデータを読み取った後 ("Data Recvd" にあたる
     /// [`crate::stream::RecvState::DataRead`]) でも送信する。RFC 9000 Section 3.3 は
     /// この状態での STOP_SENDING を MAY としつつ「little value」と述べているが、

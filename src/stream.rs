@@ -306,7 +306,8 @@ struct Stream {
     /// アプリケーションが STOP_SENDING を送信済みかどうか
     ///
     /// 送信済みの場合、以後に到着する STREAM フレームのデータはバッファせず
-    /// 破棄し、フロー制御の会計だけを行う (RFC 9000 Section 3.5)。
+    /// 破棄し、フロー制御の会計だけを行う (RFC 9000 Section 3.5)。同じストリームへ
+    /// 2 回目以降の STOP_SENDING を送らないためのフラグとしても使う。
     local_stop_sending: bool,
 }
 
@@ -986,6 +987,14 @@ impl StreamManager {
     /// 会計だけを行う (RFC 9000 Section 3.5)。破棄したデータの分もクレジットと
     /// して直ちにピアへ返すため、ピアが RESET_STREAM を返すまで接続レベルの
     /// ウィンドウが埋まり続けることはない。
+    ///
+    /// 同じストリームに対して 2 回目以降に呼び出した場合は、最初に送信した
+    /// アプリケーションエラーコードを維持し、追加のフレームを送らない。QMux の
+    /// 下位トランスポートは順序保証された信頼的なバイトストリームであり、
+    /// RFC 9000 Section 3.5 が想定する STOP_SENDING の再送は不要である。
+    ///
+    /// ピアがすでに RESET_STREAM を送っている場合、まだ STOP_SENDING を送って
+    /// いなければ `STREAM_STATE_ERROR` を返す (RFC 9000 Section 3.3)。
     pub(crate) fn stop_sending(&mut self, id: StreamId, error_code: u64) -> Result<(), Error> {
         let Some(stream) = self.streams.get_mut(&id) else {
             return Err(self.unknown_or_closed_stream_error(id, false));
@@ -996,6 +1005,12 @@ impl StreamManager {
                 reason: format!("stream {} is send-only", id.as_u64()),
             });
         };
+        // すでに STOP_SENDING を送信済みの場合は、2 回目以降の要求を無視する。
+        // アプリケーションエラーコードは最初に送った値を維持する。QMux の下位
+        // トランスポートはフレームを落とさないため、再送も不要である。
+        if stream.local_stop_sending {
+            return Ok(());
+        }
         // すでにリセットを受け取ったストリームに STOP_SENDING を送る意味はない
         // (RFC 9000 Section 3.3)
         if matches!(recv_state, RecvState::ResetRecvd | RecvState::ResetRead) {
