@@ -1722,13 +1722,18 @@ async fn idle_timeout_does_not_send_unsent_record() {
     // Section 7.2: アイドルタイムアウトが発火した時点でまだ 1 バイトも書き出して
     // いない Record は破棄し、QMux フレームを送らずに送信側を shutdown する。
     //
-    // 容量 0 の duplex は書き込みを一切受け付けないため、ドライバは Record を
-    // 生成しても written == 0 のままになる。ここで未送信 Record を破棄して
-    // shutdown しなければ、ドライバは書き込みの完了を待ち続けて linger の期限まで
-    // 終了しない。
+    // 容量 1 の duplex を 1 バイトだけ埋めておくと、ドライバの最初の書き込みは
+    // 容量不足で Pending になり、written == 0 のままになる。ここで未送信 Record を
+    // 破棄して shutdown しなければ、ドライバは書き込みの完了を待ち続けて linger の
+    // 期限まで終了しない。ピアは書き込みを Pending に保つため、アイドルタイムアウト
+    // より後に読み始める (すぐ読むと容量が空いて Record が送られてしまう)。
     let mut client_config = config();
     client_config.max_idle_timeout = Duration::from_millis(300);
-    let (mut peer_io, client_io) = tokio::io::duplex(0);
+    let (mut peer_io, mut client_io) = tokio::io::duplex(1);
+    client_io
+        .write_all(&[0xAA])
+        .await
+        .expect("duplex の送信バッファを 1 バイト埋められる");
     let client = Connection::with_linger(
         Role::Client,
         client_io,
@@ -1738,8 +1743,11 @@ async fn idle_timeout_does_not_send_unsent_record() {
     .expect("テスト用のクライアント接続を作成できる");
 
     let peer = tokio::spawn(async move {
+        // ドライバの書き込みを Pending に保つため、アイドルタイムアウトより後に
+        // 読み始める。
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let mut scratch = [0u8; 1024];
-        let mut received = 0usize;
+        let mut received = Vec::new();
         loop {
             let len = peer_io
                 .read(&mut scratch)
@@ -1754,9 +1762,9 @@ async fn idle_timeout_does_not_send_unsent_record() {
                     .expect("ピアが送信側を shutdown できる");
                 break;
             }
-            received += len;
+            received.extend_from_slice(&scratch[..len]);
         }
-        (received, peer_io)
+        received
     });
 
     // 300 秒の linger を待たずに終了すること。未送信 Record を破棄して shutdown
@@ -1770,13 +1778,14 @@ async fn idle_timeout_does_not_send_unsent_record() {
         "アイドルタイムアウトとして通知されること"
     );
 
-    let (received, _peer_io) = tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), peer)
         .await
         .expect("ピアが EOF を観測して終了すること")
         .expect("ピアのタスクが終了すること");
     assert_eq!(
-        received, 0,
-        "アイドルタイムアウト後に QMux フレームを送らないこと"
+        received,
+        vec![0xAA],
+        "アイドルタイムアウト後に未送信の QMux フレームを送らないこと"
     );
 }
 
