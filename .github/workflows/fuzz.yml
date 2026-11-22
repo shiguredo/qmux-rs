@@ -1,9 +1,6 @@
 name: Fuzz
 
 on:
-  # 毎日 03:00 JST (18:00 UTC) に実行する。cron は UTC で解釈される
-  schedule:
-    - cron: "0 18 * * *"
   # 追加した検証を手動で実行して確認するために使う
   workflow_dispatch:
 
