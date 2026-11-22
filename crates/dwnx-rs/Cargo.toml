@@ -9,4 +9,4 @@ publish = false
 # dwnx の FFI バインディング
 dwnx-sys = { path = "../dwnx-sys" }
 # dwnx の rand コールバックに渡す乱数
-getrandom = "0.3"
+getrandom = "0.4"

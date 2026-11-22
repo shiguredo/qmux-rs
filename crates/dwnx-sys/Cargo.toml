@@ -18,8 +18,8 @@ doctest = false
 
 [build-dependencies]
 # dwnx.h から Rust の FFI 宣言を生成する
-bindgen = "0.72"
+bindgen = "0.73"
 # libdwnx (C11、外部依存なし) をコンパイルする
-cc = "1.8"
+cc = "1.11"
 # 外部依存のビルド設定を読み込む
-shiguredo_toml = "2026.2"
+shiguredo_toml = "2026.3"
